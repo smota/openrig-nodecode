@@ -73,3 +73,16 @@ export async function probeSession({ ref, home = process.env.NODECODE_HOME || pa
   } while (Date.now() < deadline);
   return 'unreachable';
 }
+
+/** Checkpoint rows include terminal `ending` and the current branch's head. */
+export async function readSessionCheckpoints({ ref, home = process.env.NODECODE_HOME || path.join(os.homedir(), '.nodecode'), store, timeoutMs = 15_000 }) {
+  const owner = JSON.parse(fs.readFileSync(ownerFile(home, store), 'utf8'));
+  const token = process.env.NODECODE_GATEWAY_OPERATOR_TOKEN || process.env.NODECODE_OPERATOR_TOKEN || fs.readFileSync(path.join(home, 'operator-token'), 'utf8').trim();
+  const response = await fetch(`http://127.0.0.1:${owner.port}/api/gateway/sessions/${encodeURIComponent(ref)}/checkpoints`, {
+    headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) throw new Error(`checkpoint listing returned HTTP ${response.status}`);
+  const body = await response.json();
+  if (!Array.isArray(body.checkpoints)) throw new Error('checkpoint listing has no checkpoints array');
+  return body;
+}

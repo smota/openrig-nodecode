@@ -86,6 +86,22 @@ export function linkHomeSkills(home, seatName, workspace) {
     process.stderr.write(`nodecode: skipping home skills link; ${directory} directory is missing\n`);
     return false;
   }
+  for (const entry of fs.readdirSync(directory)) {
+    if (!entry.startsWith('openrig-')) continue;
+    const full = path.join(directory, entry);
+    try {
+      const dangling = fs.lstatSync(full).isSymbolicLink() && !fs.existsSync(full);
+      let staleWorkspace = false;
+      try {
+        const marker = JSON.parse(fs.readFileSync(path.join(full, '.openrig-seat.json'), 'utf8'));
+        if (typeof marker.workspace === 'string' && path.isAbsolute(marker.workspace)) {
+          try { staleWorkspace = !fs.statSync(marker.workspace).isDirectory(); }
+          catch (cause) { if (cause.code === 'ENOENT' || cause.code === 'ENOTDIR') staleWorkspace = true; else throw cause; }
+        }
+      } catch (cause) { if (!['ENOENT', 'ENOTDIR'].includes(cause.code) && !(cause instanceof SyntaxError)) throw cause; }
+      if (dangling || staleWorkspace) fs.rmSync(full, { recursive: true, force: true });
+    } catch (cause) { process.stderr.write(`nodecode: prune skills ${entry}: ${cause.message}\n`); }
+  }
   const name = String(seatName ?? '').replace(/[^A-Za-z0-9._-]/g, '_');
   const link = path.join(directory, `openrig-${name}`);
   const target = path.resolve(workspace, '.agents', 'skills');
@@ -97,5 +113,6 @@ export function linkHomeSkills(home, seatName, workspace) {
       fs.symlinkSync(target, link);
     } catch (cause) { process.stderr.write(`nodecode: home skills link: ${cause.message}\n`); return false; }
   }
+  fs.writeFileSync(path.join(link, '.openrig-seat.json'), `${JSON.stringify({ sessionName: seatName, workspace: path.resolve(workspace), writtenAt: new Date().toISOString() })}\n`, { mode: 0o600 });
   return true;
 }

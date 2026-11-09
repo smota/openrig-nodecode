@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { main } from '../bin/nodecode-runner.mjs';
 import { createActivity } from '../src/activity.mjs';
@@ -34,13 +34,14 @@ async function server(t, reply) {
 }
 
 // Real child and HTTP boundaries, with temporary scripts and stream-backed TTYs.
-async function runner(t, { frames = [resumed()], onCommand = [], setup = () => {}, onHook, onAsk, onPoll, tty = false, env: overrides = {}, argv = [], start, noOwner = false, gateway } = {}) {
+async function runner(t, { frames = [resumed()], onCommand = [], setup = () => {}, onHook, onAsk, onPoll, tty = false, env: overrides = {}, argv = [], start, noOwner = false, gateway, checkpoints } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nodecode-regression-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const input = new PassThrough(); input.isTTY = tty; input.setRawMode = value => { input.raw = value; };
   const output = new PassThrough(), error = new PassThrough(); let stdout = '', stderr = '';
   output.on('data', part => { stdout += part; }); error.on('data', part => { stderr += part; });
   const api = await server(t, async (r, res) => {
+    if (r.url.endsWith('/checkpoints')) return checkpoints;
     if (r.url.startsWith('/api/gateway/')) return { session_id: 'ref' };
     if (r.url === '/api/activity/hooks') { await onHook?.(r.body, { input, output, error }); return { ok: true }; }
     if (r.method === 'GET') return onPoll ? onPoll(r, res) : { state: 'answered', optionId: 'choice-0' };
@@ -53,7 +54,7 @@ async function runner(t, { frames = [resumed()], onCommand = [], setup = () => {
   fs.writeFileSync(path.join(home, 'operator-token'), 'token');
   const log = path.join(dir, 'stdin'), gatewayLog = path.join(dir, 'gateway');
   const bin = path.join(dir, 'fake.mjs');
-  fs.writeFileSync(bin, `#!${process.execPath}\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nif (process.argv.includes('gateway')) { ${gateway || `fs.writeFileSync(${JSON.stringify(gatewayLog)}, JSON.stringify({env:process.env,argv:process.argv.slice(2),tty:process.stdout.isTTY, pipe:fs.fstatSync(1).isFIFO(),ownGroup:(()=>{try{process.kill(-process.pid,0);return true}catch{return false}})()})); fs.writeFileSync(${JSON.stringify(path.join(home, 'store/main.owner'))}, JSON.stringify({pid:${process.pid},port:${api.port}}));`} } else {\nfs.writeFileSync(${JSON.stringify(path.join(dir, 'argv'))}, JSON.stringify(process.argv.slice(2))); fs.writeFileSync(${JSON.stringify(path.join(dir, 'pid'))}, String(process.pid));\nif(process.env.TEST_CLOSE_STDIN) { setTimeout(()=>{process.stdin.destroy(); try { fs.closeSync(0); } catch {}}, 100); setTimeout(()=>{process.exitCode=19;}, 1500); }\nconst send = f => process.stdout.write(JSON.stringify(f)+'\\n');\nfor (const [delay,frame] of ${JSON.stringify(frames.map(f => Array.isArray(f) ? f : [0, f]))}) setTimeout(()=>send(frame), delay);\nconst actions = ${JSON.stringify(onCommand)};\nreadline.createInterface({input:process.stdin}).on('line', line => { fs.appendFileSync(${JSON.stringify(log)}, line+'\\n'); const frame=JSON.parse(line); for(const a of actions) if(a.type===frame.type && (!a.prompt || a.prompt===frame.request?.prompt)) for(const f of a.frames) send(f); });\n}`);
+  fs.writeFileSync(bin, `#!${process.execPath}\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nif (process.argv[2] === 'profile') { fs.appendFileSync(process.env.TEST_PROFILE_CALLS, JSON.stringify(process.argv.slice(2))+'\\n'); const names=JSON.parse(fs.readFileSync(process.env.TEST_PROFILE_NAMES)); if(process.argv[3]==='list') console.log(names.map(name=>'  '+name+'  '+process.env.TEST_PROFILE_ROOT+'/'+name).join('\\n')); else if(process.argv[3]==='create') { names.push(process.argv[4]); fs.writeFileSync(process.env.TEST_PROFILE_NAMES,JSON.stringify(names)); fs.mkdirSync(process.env.TEST_PROFILE_ROOT+'/'+process.argv[4]+'/cells/linked-skills',{recursive:true}); } } else if (process.argv.includes('gateway')) { ${gateway || `fs.writeFileSync(${JSON.stringify(gatewayLog)}, JSON.stringify({env:process.env,argv:process.argv.slice(2),tty:process.stdout.isTTY, pipe:fs.fstatSync(1).isFIFO(),ownGroup:(()=>{try{process.kill(-process.pid,0);return true}catch{return false}})()})); fs.writeFileSync(${JSON.stringify(path.join(home, 'store/main.owner'))}, JSON.stringify({pid:${process.pid},port:${api.port}}));`} } else {\nfs.writeFileSync(${JSON.stringify(path.join(dir, 'argv'))}, JSON.stringify(process.argv.slice(2))); fs.writeFileSync(${JSON.stringify(path.join(dir, 'pid'))}, String(process.pid));\nif(process.env.TEST_CLOSE_STDIN) { setTimeout(()=>{process.stdin.destroy(); try { fs.closeSync(0); } catch {}}, 100); setTimeout(()=>{process.exitCode=19;}, 1500); }\nconst send = f => process.stdout.write(JSON.stringify(f)+'\\n');\nfor (const [delay,frame] of ${JSON.stringify(frames.map(f => Array.isArray(f) ? f : [0, f]))}) setTimeout(()=>send(frame), delay);\nlet navigationPending = false;\nconst actions = ${JSON.stringify(onCommand)};\nreadline.createInterface({input:process.stdin}).on('line', line => { fs.appendFileSync(${JSON.stringify(log)}, line+'\\n'); const frame=JSON.parse(line); if(frame.type==='start_turn' && navigationPending) process.stderr.write('EARLY_START\\n'); for(const a of actions) if(a.type===frame.type && (!a.prompt || a.prompt===frame.request?.prompt)) { if(a.delay && frame.type==='navigate_checkpoint') navigationPending=true; const respond=()=>{ for(const f of a.frames) send(f); if(frame.type==='navigate_checkpoint') navigationPending=false; }; if(a.delay) setTimeout(respond,a.delay); else respond(); } });\n}`);
   fs.chmodSync(bin, 0o755);
   const env = { PATH: process.env.PATH, NODECODE_BIN: bin, NODECODE_HOME: home, OPENRIG_HOME: path.join(dir, 'rig'), OPENRIG_URL: api.url, OPENRIG_ACTIVITY_HOOK_TOKEN: 'hook-token', OPENRIG_SESSION_NAME: 'pod-worker@rig', OPENRIG_NODE_ID: 'node', OPENRIG_LAUNCH_RESULT: path.join(dir, 'record'), ...overrides };
   const context = { dir, home, env, input, output, error, api, gatewayLog, log, argv };
@@ -352,4 +353,99 @@ test('20 identity HTTP failures are ignored and noted only once; disabled activi
   const disabled = createActivity({ env: { OPENRIG_HOME: '/nonexistent-nodecode-test-home' }, fetchImpl: () => assert.fail('disabled activity fetched') });
   await disabled.identity('ref');
   assert.equal(notes.length, 1);
+});
+
+
+test('stale OpenRig skill links are pruned while live and foreign entries survive', async t => {
+  const r = await runner(t, { setup({ home, dir }) {
+    const root = path.join(home, 'cells/linked-skills');
+    for (const [name, workspace] of [['openrig-stale', path.join(dir, 'missing')], ['openrig-live', dir], ['foreign', path.join(dir, 'missing')]]) {
+      fs.mkdirSync(path.join(root, name)); fs.writeFileSync(path.join(root, name, '.openrig-seat.json'), JSON.stringify({ sessionName: name, workspace, writtenAt: new Date().toISOString() }));
+    }
+    fs.symlinkSync(path.join(dir, 'missing-target'), path.join(root, 'openrig-dangling'));
+    fs.symlinkSync(path.join(dir, 'missing-target'), path.join(root, 'foreign-dangling'));
+  }, onHook: closeOnReady });
+  assert.equal(r.code, 0, r.stderr);
+  const root = path.join(r.home, 'cells/linked-skills');
+  assert.equal(fs.existsSync(path.join(root, 'openrig-stale')), false);
+  assert.throws(() => fs.lstatSync(path.join(root, 'openrig-dangling')), { code: 'ENOENT' });
+  assert.ok(fs.existsSync(path.join(root, 'openrig-live')));
+  assert.ok(fs.existsSync(path.join(root, 'foreign')));
+  assert.ok(fs.lstatSync(path.join(root, 'foreign-dangling')).isSymbolicLink());
+  const marker = JSON.parse(fs.readFileSync(path.join(root, 'openrig-pod-worker_rig/.openrig-seat.json')));
+  assert.equal(marker.workspace, path.join(r.dir, 'ws')); assert.equal(marker.sessionName, 'pod-worker@rig'); assert.ok(Number.isFinite(Date.parse(marker.writtenAt)));
+});
+
+test('seat profiles select argv, create only absent profiles and resolve profile gateway home', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'seat-profiles-')); t.after(() => fs.rmSync(root, {recursive:true,force:true}));
+  t.mock.method(os, 'homedir', () => root);
+  for (const [selection, names, expected] of [['auto', [], 'openrig-main-lead'], ['auto', ['openrig-main-lead'], 'openrig-main-lead'], ['named', [], 'named'], ['none', [], null], [null, [], 'env-profile']]) {
+    const r = await runner(t, { argv: selection ? ['--seat-profile', selection] : [], env: { OPENRIG_SESSION_NAME: 'Main Lead', OPENRIG_NODECODE_SEAT_PROFILE: 'env-profile', ...(expected ? {OPENRIG_RESUME_REF: 'ref'} : {}) }, setup({dir, home, env, api}) {
+      env.TEST_PROFILE_CALLS=path.join(dir,'profile-calls'); env.TEST_PROFILE_NAMES=path.join(dir,'names'); env.TEST_PROFILE_ROOT=path.join(root,'.nodecode/profiles');
+      fs.writeFileSync(env.TEST_PROFILE_NAMES,JSON.stringify(names));
+      if(expected) {
+        const target=path.join(env.TEST_PROFILE_ROOT,expected); fs.mkdirSync(path.join(target,'store'),{recursive:true}); fs.mkdirSync(path.join(target,'cells/linked-skills'),{recursive:true});
+        fs.writeFileSync(path.join(target,'store/main.owner'), JSON.stringify({pid:process.pid,port:api.port})); fs.writeFileSync(path.join(target,'operator-token'),'seat-token');
+        fs.writeFileSync(path.join(home,'store/main.owner'),JSON.stringify({pid:process.pid,port:1}));
+      }
+    }, onHook: closeOnReady });
+    assert.equal(r.code,0,r.stderr);
+    const args=JSON.parse(fs.readFileSync(path.join(r.dir,'argv')));
+    assert.deepEqual(args.slice(0,expected ? 3 : 1),expected ? ['-p',expected,'rpc'] : ['rpc']);
+    const calls=fs.existsSync(r.env.TEST_PROFILE_CALLS) ? fs.readFileSync(r.env.TEST_PROFILE_CALLS,'utf8').trim().split('\n').map(JSON.parse) : [];
+    assert.deepEqual(calls,expected ? [['profile','list'],...(!names.includes(expected) ? [['profile','create',expected]] : [])] : []);
+    if(expected) { assert.equal(r.requests[0].headers.authorization,'Bearer seat-token'); assert.match(r.stderr,new RegExp(expected)); }
+  }
+  const bare=await runner(t,{onHook:closeOnReady}); assert.deepEqual(JSON.parse(fs.readFileSync(path.join(bare.dir,'argv'))),['rpc']);
+});
+
+for (const [ending, policy, navigate] of [['failed', 'last-completed', true], ['completed', 'last-completed', false], ['failed', 'head', false], ['cancelled', 'last-completed', true], ['interrupted', 'last-completed', true]]) {
+  test(`checkpoint resume: ${ending} with ${policy}`, async t => {
+    const r = await runner(t, {
+      argv: ['--resume-policy', policy], env: { OPENRIG_RESUME_REF: 'ref' },
+      checkpoints: { head_turn_id: 'last', checkpoints: [
+        { kind: 'user_message', turn_id: 'good', ending: 'completed', on_head_chain: true, log_position: 1 },
+        { kind: 'user_message', turn_id: 'last', ending, on_head_chain: true, is_head: true, log_position: 2 },
+      ] },
+      onCommand: [
+        { type: 'navigate_checkpoint', delay: 80, frames: [{ payload: { type: 'gateway_turn_command_result', result: { command: 'navigate_checkpoint', status: 'accepted' } } }] },
+        { type: 'start_turn', frames: [result(), ended()] },
+      ],
+      start({ input }) { input.end('queued first prompt\n'); },
+    });
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(r.commands.map(c => c.type), navigate ? ['navigate_checkpoint', 'start_turn'] : ['start_turn']);
+    if (navigate) {
+      assert.equal(r.commands[0].target_turn_id, 'good');
+      assert.doesNotMatch(r.stderr, /EARLY_START/);
+      assert.match(r.stderr, new RegExp(`resume: head moved to turn good \\(last completed; last turn was ${ending}\\)`));
+    } else assert.doesNotMatch(r.stderr, /head moved/);
+  });
+}
+
+
+test('installed preset defaults to automatic seat profiles', t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'seat-preset-')); t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const installed=spawnSync(process.execPath,['scripts/install-preset.mjs'],{env:{...process.env,OPENRIG_HOME:dir},encoding:'utf8'});
+  assert.equal(installed.status,0,installed.stderr);
+  const preset=fs.readFileSync(path.join(dir,'community-harnesses/nodecode.yaml'),'utf8');
+  assert.match(preset,/^command: .* --seat-profile auto --resume-policy last-completed$/m);
+  assert.doesNotMatch(preset,/default home shares/);
+});
+
+test('checkpoint resume policy from env applies only to a verified resume', async t => {
+  for (const resume of [false, true]) {
+    const r = await runner(t, {
+      env: { OPENRIG_NODECODE_RESUME_POLICY: 'last-completed', ...(resume ? { OPENRIG_RESUME_REF: 'ref' } : {}) },
+      checkpoints: { head_turn_id: 'bad', checkpoints: [
+        { kind: 'user_message', turn_id: 'good', ending: 'completed', on_head_chain: true, log_position: 1 },
+        { kind: 'user_message', turn_id: 'bad', ending: 'failed', on_head_chain: true, log_position: 2 },
+      ] },
+      onCommand: [{ type: 'navigate_checkpoint', frames: [{ payload: { type: 'gateway_turn_command_result', result: { command: 'navigate_checkpoint', status: 'accepted' } } }] }],
+      onHook: closeOnReady,
+    });
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(r.commands.map(c => c.type), resume ? ['navigate_checkpoint'] : []);
+    assert.equal(r.requests.some(r => r.url.endsWith('/checkpoints')), resume);
+  }
 });

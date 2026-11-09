@@ -56,6 +56,7 @@ The value column is opinion. The two columns before it are cited fact.
 | Seam | Proof |
 |---|---|
 | Runner contract | launch_result, resume, first_input, passes_model, launch_wrapper, activity hooks, permission bridge, skill projection - 72 unit tests, fake + native nodecode |
+| Checkpoint-aware resume | Implemented: `--resume-policy last-completed` rewinds a failed, cancelled or interrupted head before queued prompts; proved by fake + native test. |
 | Strict resume | unknown `OPENRIG_RESUME_REF` -> `error: "missing"`, exit 3, no turn sent (nodecode would otherwise silently create a blank session) |
 | Live rig (`npm run test:live`) | installed daemon, throwaway `rig create --runtime nodecode`: model writes a file via `rig send`; snapshot + launch resumes the same session and the model recalls prior context; unknown runtime refused |
 | Preset | `GET /api/community-harnesses` usable; `rig spec preflight` accepts `runtime: nodecode` |

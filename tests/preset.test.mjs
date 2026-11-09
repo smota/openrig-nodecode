@@ -107,7 +107,7 @@ test('install-preset renders the absolute runner path and extra args', () => {
   assert.equal(run.stdout.trim(), dest);
   const installed = parsePreset(readFileSync(dest, 'utf8'));
   const runner = path.join(root, 'bin', 'nodecode-runner.mjs');
-  assert.equal(installed.command, `${runner} --agent-yaml X --startup-file Y --profile Z`);
+  assert.equal(installed.command, `${runner} --agent-yaml X --startup-file Y --profile Z --resume-policy last-completed`);
   assert.equal(installed.name, 'nodecode');
   for (const key of FLAG_KEYS) assert.equal(installed[key], true, key);
 

@@ -4,15 +4,28 @@ import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import readline from 'node:readline';
 import { StringDecoder } from 'node:string_decoder';
 import { parseArgs, composeFirstPrompt, launchWrapperArgv, writeLaunchRecord, nodecodeArgv } from '../src/launch.mjs';
 import { memberOf, placeSkills, linkHomeSkills } from '../src/skills.mjs';
 import { parseModelSpec } from '../src/model-spec.mjs';
-import { probeSession } from '../src/session-probe.mjs';
+import { probeSession, readSessionCheckpoints } from '../src/session-probe.mjs';
 import { createActivity } from '../src/activity.mjs';
 import { createFramer, createTurnTracker } from '../src/protocol.mjs';
+
+/** Nodecode profiles live under the operator home, even with NODECODE_HOME set. */
+export function resolveSeatHome(home, profile) {
+  return profile ? path.join(os.homedir(), '.nodecode', 'profiles', profile) : home;
+}
+
+async function ensureSeatProfile(bin, profile, env) {
+  const run = promisify(execFile);
+  const { stdout } = await run(bin, ['profile', 'list'], { env, timeout: 30000 });
+  const names = stdout.split(/\r?\n/).map(line => /^\s*\*?\s*(\S+)\s+\//.exec(line)?.[1]).filter(Boolean);
+  if (!names.includes(profile)) await run(bin, ['profile', 'create', profile], { env, timeout: 30000 });
+}
 
 /** Port of the Apache-2.0 agy runner's bracketed-paste aware raw line editor. */
 export function createInputParser(onSubmit, echo = () => {}, onInterrupt = () => {}, acceptEmpty = () => false) {
@@ -62,13 +75,25 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   let opts, wrapper;
   try { opts = parseArgs(argv); wrapper = launchWrapperArgv(env.OPENRIG_LAUNCH_WRAPPER); if (opts.store) opts.store = path.resolve(opts.store); }
   catch (cause) { note(cause.message); return 2; }
+  const resumePolicy = opts.resumePolicy ?? env.OPENRIG_NODECODE_RESUME_POLICY ?? 'head';
+  if (!['head', 'last-completed'].includes(resumePolicy)) { note('--resume-policy must be head or last-completed'); return 2; }
+  let resumeCheckpoint = null;
   const sessionName = env.OPENRIG_SESSION_NAME ?? '';
   const seatName = sessionName.replace(/[^A-Za-z0-9._-]/g, '_') || 'session';
   const openrigHome = env.OPENRIG_HOME || path.join(os.homedir(), '.openrig');
   const workspace = path.resolve(opts.workspaceRoot || path.join(openrigHome, 'state', 'openrig-nodecode', seatName));
   const home = env.NODECODE_HOME || path.join(os.homedir(), '.nodecode');
-  const profileHome = opts.profile ? path.join(os.homedir(), '.nodecode', 'profiles', opts.profile) : home;
   const bin = env.NODECODE_BIN || 'nodecode';
+  const seatProfile = opts.seatProfile ?? env.OPENRIG_NODECODE_SEAT_PROFILE ?? 'none';
+  if (seatProfile !== 'none') {
+    const profile = seatProfile === 'auto' ? `openrig-${sessionName.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'session'}` : seatProfile;
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(profile)) { note('invalid seat profile name'); return 2; }
+    opts.profile = profile;
+    try { await ensureSeatProfile(bin, profile, env); }
+    catch (cause) { note(`seat profile: ${cause.message}`); return 2; }
+    note(`seat profile: ${profile}`);
+  }
+  const profileHome = resolveSeatHome(home, opts.profile);
   const resumeRef = env.OPENRIG_RESUME_REF || null;
   const childEnv = { ...env };
   delete childEnv.OPENRIG_LAUNCH_WRAPPER;
@@ -97,6 +122,17 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     catch (cause) { note(`resume probe: ${cause.message}`); return 2; }
     if (status === 'missing') { record({ error: 'missing' }); return 3; }
     if (status !== 'exists') { note(`cannot reach nodecode gateway to verify session ${resumeRef}${wrapper.length ? '; gateway bootstrap disabled by launch wrapper' : ''}`); return 2; }
+  }
+  if (resumeRef && resumePolicy === 'last-completed') {
+    try {
+      const listing = await readSessionCheckpoints({ ref: resumeRef, home: profileHome, store: opts.store });
+      const chain = listing.checkpoints.filter(row => row.kind === 'user_message' && row.on_head_chain === true).sort((a, b) => a.log_position - b.log_position);
+      const last = chain.find(row => row.turn_id === listing.head_turn_id);
+      if (last && ['failed', 'cancelled', 'interrupted'].includes(last.ending)) {
+        const completed = [...chain].reverse().find(row => row.ending === 'completed' && row.log_position < last.log_position);
+        if (completed?.turn_id) resumeCheckpoint = { turnId: completed.turn_id, ending: last.ending };
+      }
+    } catch (cause) { note(`resume checkpoints: ${cause.message}`); return 2; }
   }
   let firstPrompt = '';
   try {
@@ -127,6 +163,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   let child, nativeRef = null, ready = false, firstTurn = true, inputEnded = false;
   let commandNumber = 0, lastInterrupt = 0, lastBeat = -Infinity, cancelRequested = false;
   let frameChain = Promise.resolve();
+  let navigationCommand = null;
   let resolveDone;
   const done = new Promise(resolve => { resolveDone = resolve; });
   const write = (frame, onWritten) => {
@@ -142,7 +179,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   const idle = () => { activity.stopBeats(); activity.startIdleBeats({ nativeRef }); };
   const work = () => { if (!ending) activity.startWorkBeats(turns.turnId); };
   const maybeCloseInput = () => {
-    if (inputEnded && ready && !turns.busy && !turns.queue.length && ![...questions.values()].some(entry => !entry.answered) && child?.stdin?.writable) child.stdin.end();
+    if (inputEnded && ready && !resumeCheckpoint && !navigationCommand && !turns.busy && !turns.queue.length && ![...questions.values()].some(entry => !entry.answered) && child?.stdin?.writable) child.stdin.end();
   };
   const start = prompt => {
     const commandId = nextCommand();
@@ -152,7 +189,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     activity.stopBeats();
   };
   const drain = () => {
-    if (!ready || ending || turns.busy) return;
+    if (!ready || ending || resumeCheckpoint || navigationCommand || turns.busy) return;
     const prompt = turns.dequeue();
     if (prompt !== undefined) start(prompt);
     else { idle(); maybeCloseInput(); }
@@ -252,6 +289,10 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
         if (frame?.event?.type === 'turn.completed') completedTurns.add(frame.event.turn_id ?? frame.turn_id);
       }
       ready = true;
+      if (resumeCheckpoint) {
+        navigationCommand = nextCommand();
+        write({ type: 'navigate_checkpoint', command_id: navigationCommand, target_turn_id: resumeCheckpoint.turnId, restore_files: false });
+      }
       record({ nativeRef });
       await post('Stop', 'nodecode_ready');
       if (ending) return;
@@ -270,6 +311,14 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     if (payload.type === 'gateway_turn_command_result') {
       const result = payload.result ?? {};
       const commandId = result.command_id ?? payload.command_id;
+      if (navigationCommand && (commandId === navigationCommand || (!commandId && result.command === 'navigate_checkpoint'))) {
+        if (result.status !== 'accepted') { note(`resume checkpoint navigation failed: ${JSON.stringify(result)}`); await finish(2, { kill: true }); return; }
+        note(`resume: head moved to turn ${resumeCheckpoint.turnId} (last completed; last turn was ${resumeCheckpoint.ending})`);
+        navigationCommand = null;
+        resumeCheckpoint = null;
+        drain();
+        return;
+      }
       const startResult = (!result.command || result.command === 'start_turn') && (!commandId || commandId === turns.commandId);
       const turnId = result.response?.turn_id ?? result.turn_id;
       const duplicate = startResult && result.status === 'accepted' && (result.message === 'turn already admitted' || (turnId && completedTurns.has(turnId)));

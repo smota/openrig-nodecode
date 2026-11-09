@@ -13,6 +13,8 @@ function startGateway(program, args, options) {
 
 function ownerFile(home, store) {
   if (store) return `${store}.owner`;
+  const sidecar = path.join(home, 'history.db.owner'); // nodecode's default store is <home>/history.db
+  if (fs.existsSync(sidecar)) return sidecar;
   try {
     const owners = fs.readdirSync(path.join(home, 'store')).filter(name => name.endsWith('.owner'));
     return owners.length === 1 ? path.join(home, 'store', owners[0]) : null;
@@ -46,7 +48,11 @@ export async function probeSession({ ref, home = process.env.NODECODE_HOME || pa
             headers: { authorization: `Bearer ${token || ''}` }, signal: AbortSignal.timeout(remaining),
           });
           if (response.status === 200) return 'exists';
-          if (response.status === 404 && (await response.json()).code === 'unknown_session') return 'missing';
+          if (response.status === 404) {
+            const body = await response.json().catch(() => ({}));
+            // nodecode answers {"error":{"code":"unknown_session",...}}; flat {code} tolerated
+            if ((body?.error?.code ?? body?.code) === 'unknown_session') return 'missing';
+          }
         }, remaining);
         if (result) return result;
       } catch { /* transport failures never mean missing */ }

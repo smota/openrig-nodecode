@@ -25,7 +25,7 @@ test('probe recognizes existing session and sends encoded ref and token', async 
   assert.equal(f.seen[0].headers.authorization, 'Bearer test-token');
 });
 test('only unknown_session 404 means missing', async t => {
-  const f = await fixture(t, 404, { code: 'unknown_session' }); f.owner();
+  const f = await fixture(t, 404, { error: { code: 'unknown_session' } }); f.owner();
   assert.equal(await probeSession({ ref: 'gone', home: f.home }), 'missing');
 });
 test('no owner starts gateway once then discovers owner', async t => {

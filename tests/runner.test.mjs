@@ -32,7 +32,7 @@ async function harness(t, { frames = [handshake()], env: overrides = {}, gateway
     let status = 200, reply = { ok: true };
     if (req.url.startsWith('/api/gateway/sessions/')) {
       status = gatewayStatus;
-      reply = status === 200 ? { session_id: ref } : { code: 'unknown_session' };
+      reply = status === 200 ? { session_id: ref } : { error: { code: 'unknown_session' } };
     } else if (req.method === 'POST' && req.url === '/api/activity/permission-requests') {
       reply = { ok: true, askId: 'ask/1', state: 'pending' };
     } else if (req.method === 'GET' && req.url === '/api/activity/permission-requests/ask%2F1?waitSeconds=25') {

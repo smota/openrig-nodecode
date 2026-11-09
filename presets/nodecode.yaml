@@ -1,0 +1,16 @@
+format: 1
+name: nodecode
+command: /ABS/openrig-nodecode/bin/nodecode-runner.mjs            # install-preset renders abs path + optional --agent-yaml/--startup-file/--profile
+maintainer: "smota/openrig-nodecode"
+limits:
+  - shell UI not shown
+  - permissions bridged from organism.questions only
+  - model/provider/effort apply to fresh sessions only (session pinned on resume)
+  - default home shares the operator's organism unless --profile
+  - node on pane PATH
+launch_result: true
+runner: true
+resume: true
+first_input: true
+passes_model: true
+launch_wrapper: true

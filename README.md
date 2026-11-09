@@ -1,0 +1,67 @@
+# openrig-nodecode
+
+OpenRig community harness runner for [nodecode](https://nodecode.ai). Node >= 20, ESM, no runtime dependencies. Apache-2.0.
+
+## Install
+
+```bash
+npm install
+```
+
+The runner bin is `openrig-nodecode-runner` (`bin/nodecode-runner.mjs`). Nodecode itself is the `nodecode` binary on `PATH` (`NODECODE_BIN` overrides it).
+
+## Preset
+
+`presets/nodecode.yaml` is a Format-1 community harness. Install it with:
+
+```bash
+node scripts/install-preset.mjs [--force] [--agent-yaml F] [--startup-file F]... [--profile NAME]
+```
+
+`npm run install-preset --` accepts the same arguments. The script writes `${OPENRIG_HOME:-~/.openrig}/community-harnesses/nodecode.yaml`, sets `command` to the absolute path of `bin/nodecode-runner.mjs`, and appends every argument except `--force`. It refuses to overwrite an existing file unless `--force`, then prints the destination path.
+
+## Env and flags
+
+```text
+nodecode-runner.mjs [--agent-yaml F] [--startup-file F]... [--workspace-root D] [--profile NAME] [--store PATH] [-- extra nodecode args]
+```
+
+Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
+
+| Variable | Role |
+| --- | --- |
+| `OPENRIG_LAUNCH_WRAPPER` | JSON argv array applied to the nodecode child. Stripped from the child env. Malformed JSON exits 2 before spawn. Never starts unwrapped. |
+| `OPENRIG_SESSION_NAME` | Seat name `<pod>-<member>@<rig>`. |
+| `OPENRIG_RESUME_REF` | Resume this nodecode session. Probed before spawn. |
+| `OPENRIG_MODEL` | `[provider/]model[:effort]` on the first turn of a fresh launch only. |
+| `OPENRIG_LAUNCH_ATTEMPT` | Attempt id written into the launch record. |
+| `OPENRIG_LAUNCH_RESULT` | Path of the launch-result record. |
+| `OPENRIG_FIRST_INPUT` | Path of the first prompt. Fresh launch only. |
+| `OPENRIG_HOME` | OpenRig home. |
+| `OPENRIG_URL` or `OPENRIG_HOST` + `OPENRIG_PORT` | OpenRig base URL. |
+| `OPENRIG_ACTIVITY_HOOK_TOKEN` | Bearer token. Fallback: `$OPENRIG_HOME/activity-endpoint.json` `{baseUrl,token}`. |
+| `OPENRIG_NODE_ID` | Seat node id on activity posts. |
+| `OPENRIG_OCCUPANT_GENERATION` | Occupant generation on activity posts. |
+| `OPENRIG_RUNTIME` | Runtime name. Default `nodecode`. |
+| `NODECODE_BIN` | Nodecode binary. Default `nodecode` on `PATH`. |
+| `NODECODE_HOME` | Nodecode home. Default `~/.nodecode`. With `--profile`, skills link from `~/.nodecode/profiles/NAME` when that directory exists. |
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Child exited cleanly. |
+| 2 | Bad args, bad launch wrapper, or resume probe unreachable. |
+| 3 | Resume session missing. |
+| 127 | Spawn failed. |
+| 130 | Operator interrupt. |
+| 143 | SIGTERM or SIGHUP. |
+| other | Child exit code. |
+
+## Limits
+
+- Shell UI is not shown.
+- Permissions are bridged from `organism.questions` only.
+- Model, provider, and effort apply to fresh sessions only. A resumed session stays pinned.
+- The default home shares the operator's organism unless `--profile` is set.
+- Node must be on the pane `PATH`.

@@ -1,0 +1,18 @@
+{
+  "name": "openrig-nodecode",
+  "version": "0.0.0",
+  "description": "OpenRig community harness runner for nodecode",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "openrig-nodecode-runner": "bin/nodecode-runner.mjs"
+  },
+  "scripts": {
+    "test": "node --test",
+    "lint": "node --check bin/*.mjs src/*.mjs",
+    "install-preset": "node scripts/install-preset.mjs"
+  }
+}

@@ -65,3 +65,17 @@ Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
 - Model, provider, and effort apply to fresh sessions only. A resumed session stays pinned.
 - The default home shares the operator's organism unless `--profile` is set.
 - Node must be on the pane `PATH`.
+
+## Verification
+
+Proved against nodecode 98dd6dc80 and OpenRig 0.7.1 (`npm test`: 65/65, node:test, fake and native):
+
+| Seam | Proof |
+|---|---|
+| Fresh launch | `nodecode rpc` on real gateway -> `OPENRIG_LAUNCH_RESULT` 0600 with `nativeRef` = session id |
+| Resume | same ref -> same session; unknown ref -> `error: "missing"`, exit 3, no turn sent |
+| Gateway down on resume | no record written, exit 2 |
+| Preset | `GET /api/community-harnesses` reports `usable: true`; `rig spec preflight` of a rig with `runtime: nodecode` is ready, `runtime: bogus` is refused |
+| Skills | seat skills linked into `<workspace>/.agents/skills` and `<home>/cells/linked-skills/openrig-<seat>` |
+
+Not proved: real-model turn quality (stub proves plumbing only); tmux-pane delivery under a live rig seat.

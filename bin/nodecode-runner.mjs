@@ -3,13 +3,13 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import readline from 'node:readline';
 import { StringDecoder } from 'node:string_decoder';
 import { parseArgs, composeFirstPrompt, launchWrapperArgv, writeLaunchRecord, nodecodeArgv } from '../src/launch.mjs';
-import { memberOf, placeSkills, linkHomeSkills } from '../src/skills.mjs';
+import { memberOf, placeSkills, linkHomeSkills, linkOpenrigCell } from '../src/skills.mjs';
 import { parseModelSpec } from '../src/model-spec.mjs';
 import { probeSession, readSessionCheckpoints } from '../src/session-probe.mjs';
 import { createActivity } from '../src/activity.mjs';
@@ -143,6 +143,10 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       if (fs.existsSync(profileHome) && fs.statSync(profileHome).isDirectory()) { try { linkHomeSkills(profileHome, sessionName, workspace); } catch (cause) { note(`skills: ${cause.message}`); } }
       else note(`skipping home skills link; profile directory ${profileHome} is missing`);
     } else { try { linkHomeSkills(home, sessionName, workspace); } catch (cause) { note(`skills: ${cause.message}`); } }
+    if (!opts.noOpenrigCell) {
+      try { linkOpenrigCell(profileHome, note, fileURLToPath(new URL('../', import.meta.url))); }
+      catch (cause) { note(`openrig cell: ${cause.message}`); }
+    }
     if (!resumeRef) {
       let firstInput = '';
       if (env.OPENRIG_FIRST_INPUT) {

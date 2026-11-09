@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /** Member id from an OpenRig session name <pod>-<member>@<rig>. */
 export function memberOf(sessionName) {
@@ -115,4 +116,22 @@ export function linkHomeSkills(home, seatName, workspace) {
   }
   fs.writeFileSync(path.join(link, '.openrig-seat.json'), `${JSON.stringify({ sessionName: seatName, workspace: path.resolve(workspace), writtenAt: new Date().toISOString() })}\n`, { mode: 0o600 });
   return true;
+}
+
+
+/** Link the bundled cell without replacing any existing entry. */
+export function linkOpenrigCell(seatHome, note = message => process.stderr.write(`nodecode: ${message}\n`), repoRoot = fileURLToPath(new URL('../', import.meta.url))) {
+  const target = path.join(repoRoot, 'cells', 'openrig');
+  const link = path.join(seatHome, 'cells', 'sam-openrig');
+  fs.mkdirSync(path.dirname(link), { recursive: true, mode: 0o700 });
+  try {
+    const entry = fs.lstatSync(link);
+    if (entry.isSymbolicLink() && path.resolve(path.dirname(link), fs.readlinkSync(link)) === target) return true;
+  } catch (cause) {
+    if (cause.code !== 'ENOENT') throw cause;
+    try { fs.symlinkSync(target, link); return true; }
+    catch (cause) { if (cause.code !== 'EEXIST') throw cause; }
+  }
+  note(`skipping openrig cell; ${link} already exists and was left untouched`);
+  return false;
 }

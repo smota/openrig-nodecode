@@ -4,11 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { main } from '../bin/nodecode-runner.mjs';
 import { createActivity } from '../src/activity.mjs';
 import { probeSession } from '../src/session-probe.mjs';
+import * as skills from '../src/skills.mjs';
 import { placeSkills, linkHomeSkills } from '../src/skills.mjs';
 
 const resumed = (extra = {}) => ({ payload: { type: 'session_stream_resumed', session_id: 'ref', ...extra } });
@@ -394,7 +396,11 @@ test('seat profiles select argv, create only absent profiles and resolve profile
     assert.deepEqual(args.slice(0,expected ? 3 : 1),expected ? ['-p',expected,'rpc'] : ['rpc']);
     const calls=fs.existsSync(r.env.TEST_PROFILE_CALLS) ? fs.readFileSync(r.env.TEST_PROFILE_CALLS,'utf8').trim().split('\n').map(JSON.parse) : [];
     assert.deepEqual(calls,expected ? [['profile','list'],...(!names.includes(expected) ? [['profile','create',expected]] : [])] : []);
-    if(expected) { assert.equal(r.requests[0].headers.authorization,'Bearer seat-token'); assert.match(r.stderr,new RegExp(expected)); }
+    if(expected) {
+      assert.equal(r.requests[0].headers.authorization,'Bearer seat-token'); assert.match(r.stderr,new RegExp(expected));
+      assert.equal(fs.readlinkSync(path.join(r.env.TEST_PROFILE_ROOT, expected, 'cells/sam-openrig')), openrigCell);
+      assert.equal(fs.existsSync(path.join(r.home, 'cells/sam-openrig')), false);
+    }
   }
   const bare=await runner(t,{onHook:closeOnReady}); assert.deepEqual(JSON.parse(fs.readFileSync(path.join(bare.dir,'argv'))),['rpc']);
 });
@@ -447,5 +453,56 @@ test('checkpoint resume policy from env applies only to a verified resume', asyn
     assert.equal(r.code, 0, r.stderr);
     assert.deepEqual(r.commands.map(c => c.type), resume ? ['navigate_checkpoint'] : []);
     assert.equal(r.requests.some(r => r.url.endsWith('/checkpoints')), resume);
+  }
+});
+
+
+const openrigCell = fileURLToPath(new URL('../cells/openrig', import.meta.url));
+
+test('openrig cell is linked in a temporary seat home at launch', async t => {
+  const r = await runner(t, { onHook: closeOnReady });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fs.readlinkSync(path.join(r.home, 'cells/sam-openrig')), openrigCell);
+});
+
+test('openrig cell linking is idempotent', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'openrig-cell-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  assert.equal(typeof skills.linkOpenrigCell, 'function');
+  const notes = [];
+  skills.linkOpenrigCell(home, message => notes.push(message));
+  const link = path.join(home, 'cells/sam-openrig');
+  const before = fs.lstatSync(link);
+  skills.linkOpenrigCell(home, message => notes.push(message));
+  assert.equal(fs.readlinkSync(link), openrigCell);
+  assert.equal(fs.lstatSync(link).ino, before.ino);
+  assert.deepEqual(notes, []);
+});
+
+test('openrig cell preserves foreign directories and symlinks with one note', async t => {
+  for (const kind of ['directory', 'symlink']) await t.test(kind, async t => {
+    const r = await runner(t, { setup({ home, dir }) {
+      const link = path.join(home, 'cells/sam-openrig');
+      if (kind === 'directory') { fs.mkdirSync(link); fs.writeFileSync(path.join(link, 'keep'), 'foreign'); }
+      else fs.symlinkSync(path.join(dir, 'missing-foreign'), link);
+    }, onHook: closeOnReady });
+    assert.equal(r.code, 0, r.stderr);
+    const link = path.join(r.home, 'cells/sam-openrig');
+    if (kind === 'directory') assert.equal(fs.readFileSync(path.join(link, 'keep'), 'utf8'), 'foreign');
+    else assert.equal(fs.readlinkSync(link), path.join(r.dir, 'missing-foreign'));
+    assert.equal(r.stderr.split('\n').filter(line => line.includes('sam-openrig')).length, 1);
+  });
+});
+
+test('--no-openrig-cell skips linking and preserves an existing cell', async t => {
+  for (const existing of [false, true]) {
+    const r = await runner(t, { argv: ['--no-openrig-cell'], setup({ home }) {
+      if (existing) fs.symlinkSync(openrigCell, path.join(home, 'cells/sam-openrig'));
+    }, onHook: closeOnReady });
+    assert.equal(r.code, 0, r.stderr);
+    const link = path.join(r.home, 'cells/sam-openrig');
+    if (existing) assert.equal(fs.readlinkSync(link), openrigCell);
+    else assert.throws(() => fs.lstatSync(link), { code: 'ENOENT' });
+    assert.doesNotMatch(r.stderr, /sam-openrig/);
   }
 });

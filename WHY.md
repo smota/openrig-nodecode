@@ -56,6 +56,9 @@ The value column is opinion. The two columns before it are cited fact.
 | Seam | Proof |
 |---|---|
 | Runner contract | launch_result, resume, first_input, passes_model, launch_wrapper, activity hooks, permission bridge, skill projection - 72 unit tests, fake + native nodecode |
+| Per-seat profile | `--seat-profile auto` selects or creates a seat profile with an isolated session store and shared memory/skills. |
+| Stale link pruning | Stale `openrig-*` skill links are pruned when their target or marker workspace disappears; foreign entries survive. |
+| Openrig cell | The runner links `cells/openrig` into the selected seat home; `rig_whoami`, `rig_queue_*`, `rig_send` and `rig_capture` are native tools, with `/rig` for other commands. `--no-openrig-cell` skips linking. |
 | Checkpoint-aware resume | Implemented: `--resume-policy last-completed` rewinds a failed, cancelled or interrupted head before queued prompts; proved by fake + native test. |
 | Strict resume | unknown `OPENRIG_RESUME_REF` -> `error: "missing"`, exit 3, no turn sent (nodecode would otherwise silently create a blank session) |
 | Live rig (`npm run test:live`) | installed daemon, throwaway `rig create --runtime nodecode`: model writes a file via `rig send`; snapshot + launch resumes the same session and the model recalls prior context; unknown runtime refused |
@@ -67,38 +70,22 @@ Known limits (also in README):
 - Permissions reach OpenRig only via `organism.questions`; no turn-cancel verb (OpenRig gap for all community harnesses, CAP:651).
 - `rig transcript --wake` cannot ask a nodecode seat (CAP:187).
 - Model/provider/effort apply to fresh sessions; resumed sessions stay pinned.
-- Default home shares the operator's organism; use `--profile` to isolate seats.
+- The bare runner shares the operator's organism; `--seat-profile auto` isolates the seat session store while sharing memory and skills. The preset selects this by default.
 - Not proved: pane loss / daemon restart mid-turn; permission bridge against a real prompt.
 
-## 4. Next: not out of the box, but architectable
+## 4. Connector work and remaining core changes
 
-```
-                 effort ->
- value ^  +--------------------------+-------------------------------+
-          | A. openrig cell          | D. Handover from memory        |
-   high   |    queue/whoami/send     |    layer+memory export is the  |
-          |    tools inside the image|    restore packet; successor   |
-          |                          |    imports, reads no transcript|
-          +--------------------------+-------------------------------+
-          | B. context-usage hook    | E. checkpoint-aware restore    |
-   mid    |    -> OpenRig watchdog   |    navigate_checkpoint to last |
-          | C. cancel + full         |    good turn on bad restore    |
-          |    permission bridge     |                                |
-          +--------------------------+-------------------------------+
-                   small                         larger
-```
-
-| # | Idea | Why | Where | Core change |
-|---|---|---|---|---|
-| A | `openrig` cell (`nc://openrig`): `rig queue whoami/claim/handoff`, `rig send`, `rig whoami --json` as native tools, auto-linked by the runner | the seat stops reasoning about the queue from memory ("what the daemon thinks you hold, not what you remember holding", CAP:51) | this repo | no |
-| B | context-usage -> OpenRig hook: runner posts the image's real window usage so the `context-usage-threshold` watchdog fires on data; the action becomes "edit context", not "compact" | replaces guessing | runner | no |
-| C | map OpenRig turn-cancel to `cancel_turn`; bridge every ask | closes the two gaps OpenRig names for community harnesses | runner | cancel verb for community presets is an upstream Ideas item |
-| D | handover = profile export/import: `rig handover` on a nodecode seat writes `nodecode profile export` as the restore packet | handover with zero context loss; what `restore-packet` (CAP:820) reaches for | runner + `handover` compaction_strategy | no |
-| E | checkpoint-aware restore: on `partially_restored` or a bad turn, `navigate_checkpoint` to the last turn that completed a queue row | turns `awaiting-decision` into a reversible automatic choice | runner + rig verbs | no |
-| F | `rig transcript --wake` for nodecode via `nodecode rpc` | parity with Claude/Codex seats | runner + transcript route | yes, small |
-| G | linked knowledge cells across a pod | pod-level memory; OpenRig has none today | profiles + runner link step | no |
-
-Recommended order: A + B (small, pure connector work), then D as the headline.
+| # | Idea | State | Result or required core change |
+|---|---|---|---|
+| A | Openrig cell | Done | Native `rig_whoami`, `rig_queue_*`, `rig_send` and `rig_capture` tools plus `/rig`, linked by the runner into the selected seat home. |
+| B | Context-usage hook | Needs OpenRig core | Accept the community runner's context-usage reports and route them to the context threshold watchdog with a Nodecode context-edit action. |
+| C | Turn cancel and full permission bridge | Needs OpenRig core | Expose turn cancellation and the remaining permission request paths to community harness runners. |
+| D | Handover from memory | Needs OpenRig core | Add profile export/import to the handover lifecycle so a Nodecode profile can serve as the restore packet. |
+| D' | Per-seat profile | Done | `--seat-profile auto` isolates the session store while sharing memory and skills. |
+| E' | Checkpoint-aware resume | Done | `--resume-policy last-completed` rewinds a failed, cancelled or interrupted head to the last completed turn before queued prompts. |
+| F | `rig transcript --wake` for Nodecode | Needs OpenRig core | Extend the transcript wake route to reach community harnesses through the Nodecode RPC runner. |
+| G | Shared knowledge across seats | Done | Seat profiles share memory and skills by default. |
+| H | Stale link pruning | Done | Launch removes stale OpenRig skill links while preserving live links and foreign entries. |
 
 ## 5. Caveats
 

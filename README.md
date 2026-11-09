@@ -25,20 +25,17 @@ node scripts/install-preset.mjs [--force] [--agent-yaml F] [--startup-file F]...
 ## Env and flags
 
 ```text
-nodecode-runner.mjs [--agent-yaml F] [--startup-file F]... [--workspace-root D] [--profile NAME] [--seat-profile auto|none|NAME] [--store PATH] [--resume-policy head|last-completed] [-- extra nodecode args]
+nodecode-runner.mjs [--agent-yaml F] [--startup-file F]... [--workspace-root D] [--profile NAME] [--seat-profile auto|none|NAME] [--store PATH] [--resume-policy head|last-completed] [--no-openrig-cell] [-- extra nodecode args]
 ```
 
 | Flag | Role |
 | --- | --- |
+| `--seat-profile auto\|none\|NAME` | Select or create a seat profile with an isolated session store and shared memory/skills. `auto` uses `openrig-` plus the session name lowercased and sanitized to letters, digits and hyphens. Flag overrides `OPENRIG_NODECODE_SEAT_PROFILE`; bare runner default is `none`. The preset selects `auto`. |
+| `--profile NAME` | Use an existing Nodecode profile (legacy flag). |
 | `--resume-policy head\|last-completed` | Overrides `OPENRIG_NODECODE_RESUME_POLICY` (default `head`). On verified resume, `last-completed` moves a failed, cancelled or interrupted head to the last completed turn before sending queued prompts. Fresh launches are unaffected. The preset selects `last-completed`. |
+| `--no-openrig-cell` | Skip linking the bundled Openrig cell into the selected seat home. Existing entries are preserved. |
 
 Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
-
-| Flag | Role |
-| --- | --- |
-| `--seat-profile auto\|none\|NAME` | Select or create a seat profile. `auto` uses `openrig-` plus the session name lowercased and sanitized to letters, digits and hyphens. Flag overrides `OPENRIG_NODECODE_SEAT_PROFILE`; bare runner default is `none`. Profiles share memories and skills by default. |
-| `--profile NAME` | Use an existing Nodecode profile (legacy flag). |
-
 
 | Variable | Role |
 | --- | --- |
@@ -59,6 +56,12 @@ Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
 | `OPENRIG_NODECODE_SEAT_PROFILE` | Fallback for `--seat-profile`; default `none`. |
 | `NODECODE_BIN` | Nodecode binary. Default `nodecode` on `PATH`. |
 | `NODECODE_HOME` | Nodecode home. Default `~/.nodecode`. Selected profiles resolve to `~/.nodecode/profiles/NAME` (Nodecode ignores `NODECODE_HOME` for profiles); skills link from `~/.nodecode/profiles/NAME` when that directory exists. |
+
+## Openrig cell
+
+At launch, the runner links `<seatHome>/cells/sam-openrig` to this checkout's `cells/openrig`, using the selected profile home or the default Nodecode home. An existing matching link is left in place; any other entry is preserved with a note. Use `--no-openrig-cell` to skip linking.
+
+The cell exposes `rig_whoami`, `rig_queue_*`, `rig_send` and `rig_capture` as native tools, plus the `/rig` command. See the [Openrig cell README](cells/openrig/README.md) for tools and settings.
 
 ## Exit codes
 

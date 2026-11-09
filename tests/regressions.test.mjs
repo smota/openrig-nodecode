@@ -295,3 +295,61 @@ test('16 bad skills warn, preserve ordinary directories and allow runner launch'
   assert.equal(linkHomeSkills(home, 'seat', path.join(r.dir, 'ws')), false); assert.equal(fs.readFileSync(path.join(link, 'keep'), 'utf8'), 'yes');
   assert.doesNotThrow(() => placeSkills(path.join(r.dir, 'ws'), path.join(r.dir, 'agent.yaml'), 'worker'));
 });
+
+test('17 separate main runs use distinct first start command ids', async t => {
+  const ids = [];
+  for (let i = 0; i < 2; i++) {
+    const r = await runner(t, { frames: [resumed()], onCommand: [{ type: 'start_turn', frames: [result(), ended()] }], onHook(h, { input }) {
+      if (h.subtype === 'nodecode_ready') input.write('work\n');
+      if (h.subtype === 'end_turn') input.end();
+    } });
+    assert.equal(r.code, 0, r.stderr);
+    ids.push(r.commands[0].command_id);
+  }
+  assert.notEqual(ids[0], ids[1]);
+});
+
+test('18 duplicate admissions reject the stale turn and drain queued prompts', async t => {
+  for (const reason of ['message', 'completed replay', 'wrapped completed replay']) await t.test(reason, async t => {
+    const duplicate = result('accepted', 'old-turn');
+    if (reason === 'message') duplicate.payload.result.message = 'turn already admitted';
+    const completed = { event: { type: 'turn.completed', turn_id: 'old-turn' } };
+    const r = await runner(t, { frames: [resumed({ accumulated_frames: [reason === 'wrapped completed replay' ? { frame: completed } : completed] })], onCommand: [
+      { type: 'start_turn', prompt: 'one', frames: [duplicate] },
+      { type: 'start_turn', prompt: 'two', frames: [result(), ended()] },
+    ], onHook(h, { input }) {
+      if (h.subtype === 'nodecode_ready') input.write('one\ntwo\n');
+      if (h.subtype === 'end_turn') input.end();
+    } });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stderr, /command rejected.*old-turn/);
+    assert.deepEqual(r.commands.map(c => c.request.prompt), ['one', 'two']);
+    assert.deepEqual(r.hooks.filter(h => h.subtype === 'accepted').map(h => h.turnId), ['turn']);
+  });
+});
+
+test('19 ready publishes the recorded native session identity in hook order', async t => {
+  const r = await runner(t, { env: { OPENRIG_OCCUPANT_GENERATION: '7', OPENRIG_RUNTIME: 'other' }, onHook: closeOnReady });
+  assert.equal(r.code, 0, r.stderr);
+  const identities = r.hooks.filter(h => h.eventFamily === 'session_identity');
+  assert.equal(identities.length, 1);
+  const identity = identities[0];
+  assert.equal(identity.sessionId, JSON.parse(fs.readFileSync(r.env.OPENRIG_LAUNCH_RESULT)).nativeRef);
+  assert.deepEqual({ ...identity, sequence: undefined, occurredAt: undefined }, {
+    eventFamily: 'session_identity', sessionId: 'ref', sessionName: 'pod-worker@rig', nodeId: 'node', generation: '7', runtime: 'nodecode', sequence: undefined, occurredAt: undefined,
+  });
+  assert.ok(identity.sequence > r.hooks.find(h => h.subtype === 'nodecode_ready').sequence);
+  assert.ok(Number.isFinite(Date.parse(identity.occurredAt)));
+});
+
+test('20 identity HTTP failures are ignored and noted only once; disabled activity is a no-op', async t => {
+  const notes = []; t.mock.method(process.stderr, 'write', s => { notes.push(s); return true; });
+  const api = await server(t, (_r, res) => { res.writeHead(503); res.end('unavailable'); });
+  const activity = createActivity({ env: { OPENRIG_URL: api.url, OPENRIG_ACTIVITY_HOOK_TOKEN: 't' } });
+  await activity.identity('ref'); await activity.identity('ref');
+  assert.equal(api.requests.length, 2);
+  assert.equal(notes.length, 1); assert.match(notes[0], /identity/i);
+  const disabled = createActivity({ env: { OPENRIG_HOME: '/nonexistent-nodecode-test-home' }, fetchImpl: () => assert.fail('disabled activity fetched') });
+  await disabled.identity('ref');
+  assert.equal(notes.length, 1);
+});

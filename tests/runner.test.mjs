@@ -13,7 +13,7 @@ const ref = 'native-session-1';
 const turnId = 'turn-1';
 const firstInput = '  First input: café 🧪\r\nsecond line\t \n\n';
 const handshake = (session = ref) => ({ session_id: session, payload: { type: 'session_stream_resumed', replay_chunk_final: true } });
-const accepted = { payload: { type: 'gateway_turn_command_result', result: { command: 'start_turn', command_id: 'cmd-1', status: 'accepted', response: { turn_id: turnId } } } };
+const accepted = { payload: { type: 'gateway_turn_command_result', result: { command: 'start_turn', status: 'accepted', response: { turn_id: turnId } } } };
 const completed = (turn = turnId) => ({ payload: { type: 'session_stream_event', frame: { event: { type: 'turn.completed', turn_id: turn } } } });
 const delta = value => ({ payload: { type: 'item_delta', turn_id: turnId, delta: value } });
 const simpleTurn = [handshake(), { after_stdin: '"type":"start_turn"', frames: [accepted, completed()] }];

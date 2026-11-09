@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -118,6 +119,8 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   } catch (cause) { note(cause.message); return 2; }
   const args = nodecodeArgv({ bin, profile: opts.profile, store: opts.store, resumeRef, extra: opts.nodecodeArgs, wrapper });
   const turns = createTurnTracker();
+  const completedTurns = new Set();
+  const commandNonce = randomUUID().slice(0, 8);
   const questions = new Map();
   const tools = new Set();
   const reasoning = new Set();
@@ -131,7 +134,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     try { child.stdin.write(`${JSON.stringify(frame)}\n`, cause => onWritten?.(!cause)); return true; }
     catch (cause) { streamError(cause); return false; }
   };
-  const nextCommand = () => `cmd-${++commandNumber}`;
+  const nextCommand = () => `cmd-${commandNonce}-${++commandNumber}`;
   const cancel = () => {
     if (turns.turnId) write({ type: 'cancel_turn', command_id: nextCommand(), turn_id: turns.turnId });
     else if (turns.busy) { if (turns.submitted) cancelRequested = true; note('cannot abort yet: active turn has no turn id'); }
@@ -243,12 +246,18 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       nativeRef = frame.session_id || payload.session_id || payload.header?.session_id || resumeRef;
       if (resumeRef && nativeRef !== resumeRef) { record({ error: 'missing' }); await finish(3, { kill: true }); return; }
       if (!nativeRef) { note('session replay did not identify a native session'); return; }
+      const frames = Array.isArray(payload.accumulated_frames) ? payload.accumulated_frames : [];
+      for (const value of frames) {
+        const frame = value?.frame ?? value;
+        if (frame?.event?.type === 'turn.completed') completedTurns.add(frame.event.turn_id ?? frame.turn_id);
+      }
       ready = true;
       record({ nativeRef });
       await post('Stop', 'nodecode_ready');
       if (ending) return;
+      await activity.identity(nativeRef);
+      if (ending) return;
       if (payload.admission_state === 'active') {
-        const frames = Array.isArray(payload.accumulated_frames) ? payload.accumulated_frames : [];
         const latest = [...frames].reverse().find(value => value?.turn_id || value?.event?.turn_id);
         turns.observe(payload.turn_id ?? latest?.turn_id ?? latest?.event?.turn_id);
         if (!turns.turnId) turns.accepted = true;
@@ -262,19 +271,21 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       const result = payload.result ?? {};
       const commandId = result.command_id ?? payload.command_id;
       const startResult = (!result.command || result.command === 'start_turn') && (!commandId || commandId === turns.commandId);
-      if (result.status === 'accepted' || result.status === 'queued') {
-        if (startResult && turns.accept(commandId, result.response?.turn_id ?? result.turn_id)) {
-          firstTurn = false;
-          await post('UserPromptSubmit', 'accepted', { turnId: turns.turnId });
-          work();
-          if (cancelRequested) { cancelRequested = false; cancel(); }
-        }
-      } else if (result.status === 'rejected') {
+      const turnId = result.response?.turn_id ?? result.turn_id;
+      const duplicate = startResult && result.status === 'accepted' && (result.message === 'turn already admitted' || (turnId && completedTurns.has(turnId)));
+      if (duplicate || result.status === 'rejected') {
         note(`command rejected: ${JSON.stringify(result)}`);
         if (startResult && turns.reject(commandId)) {
           cancelRequested = false;
           if (!turns.busy && !turns.queue.length) await post('Stop', 'error');
           drain();
+        }
+      } else if (result.status === 'accepted' || result.status === 'queued') {
+        if (startResult && turns.accept(commandId, turnId)) {
+          firstTurn = false;
+          await post('UserPromptSubmit', 'accepted', { turnId: turns.turnId });
+          work();
+          if (cancelRequested) { cancelRequested = false; cancel(); }
         }
       }
       return;

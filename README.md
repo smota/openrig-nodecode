@@ -78,4 +78,12 @@ Proved against nodecode 98dd6dc80 and OpenRig 0.7.1 (`npm test`: 65/65, node:tes
 | Preset | `GET /api/community-harnesses` reports `usable: true`; `rig spec preflight` of a rig with `runtime: nodecode` is ready, `runtime: bogus` is refused |
 | Skills | seat skills linked into `<workspace>/.agents/skills` and `<home>/cells/linked-skills/openrig-<seat>` |
 
-Not proved: real-model turn quality (stub proves plumbing only); tmux-pane delivery under a live rig seat.
+| Live rig (`npm run test:live`) | installed daemon, throwaway `rig create --runtime nodecode`: real model writes a file via `rig send`; `rig down --snapshot` + `rig launch` resumes the same session and the model recalls prior context; unknown runtime refused |
+
+Not proved: behaviour under tmux pane loss/daemon restart mid-turn; permission bridge against a real question prompt (fake-nodecode only).
+
+## Live rig proof
+
+Run `npm run test:live` to exercise the installed OpenRig daemon on `:7433` through `rig` and tmux. The daemon must already be running, with the nodecode runtime installed and authenticated; `rig` and `tmux` must be on `PATH`. This uses the installed connector, not necessarily this checkout.
+
+The opt-in test creates a temporary one-seat rig, observes startup and a real `proof.txt` write, snapshots and resumes the seat, checks recalled session memory in the pane, and rejects an unknown runtime. An `after()` hook deletes the throwaway rig and temporary directory. Ordinary `npm test` skips it unless `OPENRIG_LIVE_RIG=1`; live turns can consume model quota and each polling step allows up to 120 seconds.

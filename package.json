@@ -12,6 +12,7 @@
   },
   "scripts": {
     "test": "node --test",
+    "test:live": "OPENRIG_LIVE_RIG=1 node --test tests/live-rig.test.mjs",
     "lint": "node --check bin/*.mjs src/*.mjs",
     "install-preset": "node scripts/install-preset.mjs"
   }

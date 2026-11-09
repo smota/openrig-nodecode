@@ -54,6 +54,15 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
     }
     return enqueue('/api/activity/hooks', { ...extra, ...identity, sequence: ++sequence, hookEvent, subtype, occurredAt: occurredAt() });
   };
+  let identityWarned = false;
+  const publishIdentity = async sessionId => {
+    if (!endpoint) return;
+    const result = await enqueue('/api/activity/hooks', { eventFamily: 'session_identity', sessionId, ...identity, runtime: 'nodecode', sequence: ++sequence, occurredAt: occurredAt() });
+    if (result === null && !identityWarned) {
+      identityWarned = true;
+      process.stderr.write('nodecode: session identity hook failed; continuing\n');
+    }
+  };
   const stopBeats = () => { clearInterval(beat); beat = undefined; };
   const startIdleBeats = () => {
     stopBeats();
@@ -123,5 +132,5 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
     return task;
   };
   const withdrawAll = reason => Promise.all([...asks].map(state => state.withdraw(reason)));
-  return { enabled: Boolean(endpoint), post, startIdleBeats, startWorkBeats, stopBeats, ask, withdrawAll };
+  return { enabled: Boolean(endpoint), identity: publishIdentity, post, startIdleBeats, startWorkBeats, stopBeats, ask, withdrawAll };
 }

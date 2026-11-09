@@ -2,6 +2,8 @@
 
 OpenRig community harness runner for [nodecode](https://nodecode.ai). Node >= 20, ESM, no runtime dependencies. Apache-2.0.
 
+Why this exists, what is proved today and what comes next: [WHY.md](WHY.md).
+
 ## Install
 
 ```bash

@@ -65,10 +65,11 @@ Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
 - Model, provider, and effort apply to fresh sessions only. A resumed session stays pinned.
 - The default home shares the operator's organism unless `--profile` is set.
 - Node must be on the pane `PATH`.
+- Skill links under `<home>/cells/linked-skills/openrig-<seat>` are not removed when a rig is deleted; prune them by hand.
 
 ## Verification
 
-Proved against nodecode 98dd6dc80 and OpenRig 0.7.1 (`npm test`: 65/65, node:test, fake and native):
+Proved against nodecode 98dd6dc80 and OpenRig 0.7.1 (`npm test`: 72/72 unit, node:test, fake and native; plus 6 opt-in live steps via `npm run test:live`):
 
 | Seam | Proof |
 |---|---|

@@ -47,3 +47,44 @@ test('explicit store owner and unreachable cases', async t => {
   fs.rmSync(path.join(f.home, 'store', 'main.owner'));
   assert.equal(await probeSession({ ref: 'r', home: f.home, timeoutMs: 25, exec: async () => {} }), 'unreachable');
 });
+
+test('2 direct probe blocks gateway bootstrap whenever the launch wrapper is set', async t => {
+  const f = await fixture(t);
+  const previous = process.env.OPENRIG_LAUNCH_WRAPPER;
+  t.after(() => { if (previous === undefined) delete process.env.OPENRIG_LAUNCH_WRAPPER; else process.env.OPENRIG_LAUNCH_WRAPPER = previous; });
+  const notes = []; t.mock.method(process.stderr, 'write', text => { notes.push(text); return true; });
+  const marker = path.join(f.home, 'started');
+  const program = path.join(f.home, 'gateway.mjs');
+  fs.writeFileSync(program, `#!${process.execPath}\nimport fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'started');\n`);
+  fs.chmodSync(program, 0o755);
+  const previousBin = process.env.NODECODE_BIN;
+  t.after(() => { if (previousBin === undefined) delete process.env.NODECODE_BIN; else process.env.NODECODE_BIN = previousBin; });
+  process.env.NODECODE_BIN = program;
+  let injectedCalls = 0;
+  for (const wrapper of ['["/usr/bin/env"]', '']) {
+    process.env.OPENRIG_LAUNCH_WRAPPER = wrapper;
+    assert.equal(await probeSession({ ref: 'r', home: f.home, timeoutMs: 100 }), 'unreachable');
+    assert.equal(await probeSession({ ref: 'r', home: f.home, timeoutMs: 100, exec: async () => { injectedCalls++; } }), 'unreachable');
+  }
+  assert.equal(injectedCalls, 0);
+  assert.equal(fs.existsSync(marker), false);
+  assert.match(notes.join(''), /wrapper/i);
+});
+
+test('2 direct default probe spawns a detached gateway with clean env and ignored stdio', async t => {
+  const f = await fixture(t);
+  const keys = ['OPENRIG_LAUNCH_WRAPPER', 'OPENRIG_PROBE_TEST', 'NODECODE_BIN'];
+  const previous = keys.map(key => process.env[key]);
+  t.after(() => keys.forEach((key, index) => { if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index]; }));
+  delete process.env.OPENRIG_LAUNCH_WRAPPER;
+  process.env.OPENRIG_PROBE_TEST = 'must-not-reach-gateway';
+  const marker = path.join(f.home, 'started.json');
+  const program = path.join(f.home, 'gateway.mjs');
+  f.owner();
+  const owner = fs.readFileSync(path.join(f.home, 'store/main.owner'), 'utf8');
+  fs.rmSync(path.join(f.home, 'store/main.owner'));
+  fs.writeFileSync(program, `#!${process.execPath}\nimport fs from 'node:fs';\nlet detached = false; try { process.kill(-process.pid, 0); detached = true; } catch {}\nfs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ argv: process.argv.slice(2), home: process.env.NODECODE_HOME, openrigKeys: Object.keys(process.env).filter(key => key.startsWith('OPENRIG_')), detached, stdio: [0,1,2].map(fd => fs.fstatSync(fd).isCharacterDevice()) }));\nfs.writeFileSync(${JSON.stringify(path.join(f.home, 'store/main.owner'))}, ${JSON.stringify(owner)});\n`);
+  fs.chmodSync(program, 0o755); process.env.NODECODE_BIN = program;
+  assert.equal(await probeSession({ ref: 'r', home: f.home, profile: 'seat', timeoutMs: 1000 }), 'exists');
+  assert.deepEqual(JSON.parse(fs.readFileSync(marker, 'utf8')), { argv: ['-p', 'seat', 'gateway', 'on'], home: f.home, openrigKeys: [], detached: true, stdio: [true, true, true] });
+});

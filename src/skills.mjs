@@ -56,17 +56,19 @@ export function placeSkills(workspace, agentYaml, member) {
   const keep = new Set();
   const placed = [];
   for (const skill of wanted) {
-    const target = fs.realpathSync(path.resolve(agentDir, skill.path));
-    if (!fs.existsSync(path.join(target, 'SKILL.md'))) continue;
-    const link = path.join(skillsDir, skill.id);
     keep.add(skill.id);
-    let current = null;
-    try { current = fs.readlinkSync(link); } catch { /* absent or not a link */ }
-    if (current !== target) {
-      fs.rmSync(link, { force: true, recursive: false });
-      fs.symlinkSync(target, link);
-    }
-    placed.push(skill.id);
+    try {
+      const target = fs.realpathSync(path.resolve(agentDir, skill.path));
+      if (!fs.existsSync(path.join(target, 'SKILL.md'))) continue;
+      const link = path.join(skillsDir, skill.id);
+      let current = null;
+      try { current = fs.readlinkSync(link); } catch { /* absent or not a link */ }
+      if (current !== target) {
+        fs.rmSync(link, { force: true, recursive: false });
+        fs.symlinkSync(target, link);
+      }
+      placed.push(skill.id);
+    } catch (cause) { process.stderr.write(`nodecode: skill ${skill.id}: ${cause.message}\n`); }
   }
   for (const entry of fs.readdirSync(skillsDir)) {
     const full = path.join(skillsDir, entry);
@@ -90,8 +92,10 @@ export function linkHomeSkills(home, seatName, workspace) {
   let current = null;
   try { current = fs.readlinkSync(link); } catch { /* absent or not a link */ }
   if (current !== target) {
-    fs.rmSync(link, { force: true, recursive: false });
-    fs.symlinkSync(target, link);
+    try {
+      fs.rmSync(link, { force: true, recursive: false });
+      fs.symlinkSync(target, link);
+    } catch (cause) { process.stderr.write(`nodecode: home skills link: ${cause.message}\n`); return false; }
   }
   return true;
 }

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { spawn, execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 import { StringDecoder } from 'node:string_decoder';
 import { parseArgs, composeFirstPrompt, launchWrapperArgv, writeLaunchRecord, nodecodeArgv } from '../src/launch.mjs';
@@ -14,7 +14,7 @@ import { createActivity } from '../src/activity.mjs';
 import { createFramer, createTurnTracker } from '../src/protocol.mjs';
 
 /** Port of the Apache-2.0 agy runner's bracketed-paste aware raw line editor. */
-export function createInputParser(onSubmit, echo = () => {}, onInterrupt = () => {}) {
+export function createInputParser(onSubmit, echo = () => {}, onInterrupt = () => {}, acceptEmpty = () => false) {
   const decoder = new StringDecoder('utf8');
   let buffer = '';
   let inPaste = false;
@@ -37,7 +37,7 @@ export function createInputParser(onSubmit, echo = () => {}, onInterrupt = () =>
         const text = buffer;
         buffer = '';
         echo('\n');
-        if (text.trim()) onSubmit(text, { pasted });
+        if (text.trim() || acceptEmpty()) onSubmit(text, { pasted });
         pasted = false;
       } else {
         previousCR = false;
@@ -59,19 +59,21 @@ export function createInputParser(onSubmit, echo = () => {}, onInterrupt = () =>
 export async function main({ argv = process.argv.slice(2), env = process.env, input = process.stdin, output = process.stdout, error = process.stderr } = {}) {
   const note = message => error.write(`[nodecode-runner] ${message}\n`);
   let opts, wrapper;
-  try { opts = parseArgs(argv); wrapper = launchWrapperArgv(env.OPENRIG_LAUNCH_WRAPPER); }
+  try { opts = parseArgs(argv); wrapper = launchWrapperArgv(env.OPENRIG_LAUNCH_WRAPPER); if (opts.store) opts.store = path.resolve(opts.store); }
   catch (cause) { note(cause.message); return 2; }
   const sessionName = env.OPENRIG_SESSION_NAME ?? '';
   const seatName = sessionName.replace(/[^A-Za-z0-9._-]/g, '_') || 'session';
   const openrigHome = env.OPENRIG_HOME || path.join(os.homedir(), '.openrig');
   const workspace = path.resolve(opts.workspaceRoot || path.join(openrigHome, 'state', 'openrig-nodecode', seatName));
   const home = env.NODECODE_HOME || path.join(os.homedir(), '.nodecode');
+  const profileHome = opts.profile ? path.join(os.homedir(), '.nodecode', 'profiles', opts.profile) : home;
   const bin = env.NODECODE_BIN || 'nodecode';
   const resumeRef = env.OPENRIG_RESUME_REF || null;
   const childEnv = { ...env };
   delete childEnv.OPENRIG_LAUNCH_WRAPPER;
   const activity = createActivity({ env: { ...env, OPENRIG_RUNTIME: env.OPENRIG_RUNTIME || 'nodecode' } });
-  const post = (event, subtype, extra = {}) => Promise.resolve(activity.post(event, subtype, extra)).catch(cause => note(`activity: ${cause.message}`));
+  let ending = false;
+  const post = (event, subtype, extra = {}) => ending ? Promise.resolve() : Promise.resolve(activity.post(event, subtype, extra)).catch(cause => note(`activity: ${cause.message}`));
   const record = value => {
     try { writeLaunchRecord(env.OPENRIG_LAUNCH_RESULT, { attempt: env.OPENRIG_LAUNCH_ATTEMPT, ...value }); }
     catch (cause) { note(`launch record: ${cause.message}`); }
@@ -79,26 +81,31 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   if (resumeRef) {
     if (env.OPENRIG_MODEL) note('ignoring OPENRIG_MODEL on resume; model is pinned to the session');
     const exec = (_program, args, options = {}) => {
+      if (wrapper.length) { note('cannot start gateway without the configured launch wrapper'); throw new Error('gateway bootstrap blocked by launch wrapper'); }
       // Probe owns when to start the gateway; preserve the selected binary/profile here.
-      const actual = [...(opts.profile ? ['-p', opts.profile] : []), ...(args?.length ? args : ['gateway', 'on'])];
-      return new Promise((resolve, reject) => execFile(bin, actual, { ...options, env: { ...childEnv, NODECODE_HOME: home } }, (cause, stdout) => cause ? reject(cause) : resolve(stdout)));
+      const actual = [...(opts.profile ? ['-p', opts.profile] : []), ...(opts.store ? ['--store', opts.store] : []), ...(args?.length ? args : ['gateway', 'on'])];
+      const gatewayEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('OPENRIG_')));
+      return new Promise((resolve, reject) => {
+        const starter = spawn(bin, actual, { ...options, env: { ...gatewayEnv, NODECODE_HOME: home }, detached: true, stdio: 'ignore' });
+        starter.once('error', reject);
+        starter.once('spawn', () => { starter.unref(); resolve(); });
+      });
     };
     let status;
-    try { status = await probeSession({ ref: resumeRef, home, store: opts.store, exec }); }
+    try { status = await probeSession({ ref: resumeRef, home: profileHome, store: opts.store, exec, allowStart: !wrapper.length }); }
     catch (cause) { note(`resume probe: ${cause.message}`); return 2; }
     if (status === 'missing') { record({ error: 'missing' }); return 3; }
-    if (status !== 'exists') { note(`cannot reach nodecode gateway to verify session ${resumeRef}`); return 2; }
+    if (status !== 'exists') { note(`cannot reach nodecode gateway to verify session ${resumeRef}${wrapper.length ? '; gateway bootstrap disabled by launch wrapper' : ''}`); return 2; }
   }
   let firstPrompt = '';
   try {
     fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
-    if (opts.agentYaml) placeSkills(workspace, path.resolve(opts.agentYaml), memberOf(sessionName));
+    if (opts.agentYaml) { try { placeSkills(workspace, path.resolve(opts.agentYaml), memberOf(sessionName)); } catch (cause) { note(`skills: ${cause.message}`); } }
     else fs.mkdirSync(path.join(workspace, '.agents', 'skills'), { recursive: true, mode: 0o700 });
     if (opts.profile) {
-      const profileHome = path.join(os.homedir(), '.nodecode', 'profiles', opts.profile);
-      if (fs.existsSync(profileHome) && fs.statSync(profileHome).isDirectory()) linkHomeSkills(profileHome, sessionName, workspace);
+      if (fs.existsSync(profileHome) && fs.statSync(profileHome).isDirectory()) { try { linkHomeSkills(profileHome, sessionName, workspace); } catch (cause) { note(`skills: ${cause.message}`); } }
       else note(`skipping home skills link; profile directory ${profileHome} is missing`);
-    } else linkHomeSkills(home, sessionName, workspace);
+    } else { try { linkHomeSkills(home, sessionName, workspace); } catch (cause) { note(`skills: ${cause.message}`); } }
     if (!resumeRef) {
       let firstInput = '';
       if (env.OPENRIG_FIRST_INPUT) {
@@ -114,32 +121,30 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   const questions = new Map();
   const tools = new Set();
   const reasoning = new Set();
-  let child, nativeRef = null, ready = false, firstTurn = true, ending = false, inputEnded = false;
+  let child, nativeRef = null, ready = false, firstTurn = true, inputEnded = false;
   let commandNumber = 0, lastInterrupt = 0, lastBeat = -Infinity, cancelRequested = false;
   let frameChain = Promise.resolve();
   let resolveDone;
   const done = new Promise(resolve => { resolveDone = resolve; });
-  const write = frame => {
+  const write = (frame, onWritten) => {
     if (ending || !child?.stdin?.writable || child.stdin.destroyed) return false;
-    child.stdin.write(`${JSON.stringify(frame)}\n`);
-    return true;
+    try { child.stdin.write(`${JSON.stringify(frame)}\n`, cause => onWritten?.(!cause)); return true; }
+    catch (cause) { streamError(cause); return false; }
   };
   const nextCommand = () => `cmd-${++commandNumber}`;
   const cancel = () => {
     if (turns.turnId) write({ type: 'cancel_turn', command_id: nextCommand(), turn_id: turns.turnId });
-    else if (turns.submitted) cancelRequested = true;
+    else if (turns.busy) { if (turns.submitted) cancelRequested = true; note('cannot abort yet: active turn has no turn id'); }
   };
   const idle = () => { activity.stopBeats(); activity.startIdleBeats({ nativeRef }); };
-  // Deltas share lastBeat below; a second interval would bypass that throttle.
-  const work = () => { activity.stopBeats(); };
+  const work = () => { if (!ending) activity.startWorkBeats(turns.turnId); };
   const maybeCloseInput = () => {
-    if (inputEnded && ready && !turns.busy && !turns.queue.length && !questions.size && child?.stdin?.writable) child.stdin.end();
+    if (inputEnded && ready && !turns.busy && !turns.queue.length && ![...questions.values()].some(entry => !entry.answered) && child?.stdin?.writable) child.stdin.end();
   };
   const start = prompt => {
     const commandId = nextCommand();
     if (!turns.submit(commandId)) { turns.enqueue(prompt); return; }
     const model = !resumeRef && firstTurn ? parseModelSpec(env.OPENRIG_MODEL) : {};
-    firstTurn = false;
     write({ type: 'start_turn', command_id: commandId, request: { prompt, ...model } });
     activity.stopBeats();
   };
@@ -150,26 +155,34 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     else { idle(); maybeCloseInput(); }
   };
   const printQuestion = question => {
-    note(`${question.title}${question.detail ? `\n${question.detail}` : ''}\n${question.choices.join('\n')}\nType an exact choice to answer.`);
+    const choices = Array.isArray(question.choices) ? question.choices : [];
+    note(`${question.title}${question.detail ? `\n${question.detail}` : ''}\n${choices.join('\n')}\n${choices.length ? 'Type an exact choice' : 'Type any line'} to answer.`);
   };
-  const answer = (questionId, choice, fromActivity = false) => {
+  const answer = async (questionId, choice, fromActivity = false) => {
     const pending = questions.get(questionId);
-    if (!pending || pending.answered || !pending.question.choices.includes(choice)) return false;
-    if (!write({ type: 'answer_question', command_id: nextCommand(), question_id: questionId, answer: choice })) return false;
+    const choices = pending?.question.choices;
+    if (!pending || pending.answered || pending.answering || (Array.isArray(choices) && choices.length && !choices.includes(choice))) return false;
+    pending.answering = true;
+    const written = await new Promise(resolve => {
+      if (!write({ type: 'answer_question', command_id: nextCommand(), question_id: questionId, answer: choice }, resolve)) resolve(false);
+    });
+    pending.answering = false;
+    if (!written || ending) return false;
     pending.answered = true;
     if (!fromActivity) {
       void pending.handle?.withdraw?.('turn_ended');
       void post('active', 'permission_resolved', { turnId: turns.turnId });
     }
+    maybeCloseInput();
     return true;
   };
   const ask = entry => {
     const question = entry.question;
     const onAnswer = choice => {
-      if (questions.get(question.question_id) !== entry || ending) return;
-      answer(question.question_id, choice, true);
+      if (questions.get(question.question_id) !== entry || ending) return false;
+      return answer(question.question_id, choice, true);
     };
-    if (!activity.enabled) { printQuestion(question); return; }
+    if (!activity.enabled || !Array.isArray(question.choices) || !question.choices.length) { printQuestion(question); return; }
     try {
       entry.handle = activity.ask({ question, nativeRef, turnId: turns.turnId, onAnswer });
       entry.handle?.catch(() => { if (questions.get(question.question_id) === entry && !ending) printQuestion(question); });
@@ -177,8 +190,8 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   };
   const submit = (prompt, { pasted = false } = {}) => {
     if (ending) return;
+    for (const [id, entry] of questions) if (!entry.answered && (!Array.isArray(entry.question.choices) || !entry.question.choices.length || entry.question.choices.includes(prompt))) { answer(id, prompt); return; }
     if (!pasted && prompt.trim() === '/abort' && !prompt.includes('\n') && !prompt.includes('\r')) { cancel(); return; }
-    for (const [id, entry] of questions) if (!entry.answered && entry.question.choices.includes(prompt)) { answer(id, prompt); return; }
     turns.enqueue(prompt);
     drain();
   };
@@ -205,11 +218,16 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       force.unref();
     }
     try { await activity.withdrawAll('exited'); } catch (cause) { note(`permission withdrawal: ${cause.message}`); }
-    await post('Stop', 'nodecode_exited');
+    await activity.post('Stop', 'nodecode_exited');
+    for (const stream of [output, input]) {
+      if (stream.closed) stream.off('error', streamError);
+      else stream.once('close', () => stream.off('error', streamError));
+    }
     resolveDone(code);
   };
   const interrupt = () => {
-    if (turns.busy) { cancel(); return; }
+    if (turns.turnId) { cancel(); return; }
+    if (turns.submitted) cancelRequested = true;
     const now = Date.now();
     if (lastInterrupt && now - lastInterrupt <= 2000) { void finish(130, { kill: true }); return; }
     lastInterrupt = now;
@@ -219,17 +237,19 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   const handleFrame = async frame => {
     if (ending || !frame || typeof frame !== 'object') return;
     const payload = frame.payload ?? frame;
+    if (!payload || typeof payload !== 'object') return;
     if (payload.type === 'session_stream_resumed') {
       if (ready) return;
-      nativeRef = frame.session_id || payload.session_id;
+      nativeRef = frame.session_id || payload.session_id || payload.header?.session_id || resumeRef;
       if (resumeRef && nativeRef !== resumeRef) { record({ error: 'missing' }); await finish(3, { kill: true }); return; }
       if (!nativeRef) { note('session replay did not identify a native session'); return; }
       ready = true;
       record({ nativeRef });
       await post('Stop', 'nodecode_ready');
+      if (ending) return;
       if (payload.admission_state === 'active') {
-        const frames = payload.accumulated_frames ?? [];
-        const latest = [...frames].reverse().find(value => value.turn_id || value.event?.turn_id);
+        const frames = Array.isArray(payload.accumulated_frames) ? payload.accumulated_frames : [];
+        const latest = [...frames].reverse().find(value => value?.turn_id || value?.event?.turn_id);
         turns.observe(payload.turn_id ?? latest?.turn_id ?? latest?.event?.turn_id);
         if (!turns.turnId) turns.accepted = true;
         work();
@@ -244,6 +264,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       const startResult = (!result.command || result.command === 'start_turn') && (!commandId || commandId === turns.commandId);
       if (result.status === 'accepted' || result.status === 'queued') {
         if (startResult && turns.accept(commandId, result.response?.turn_id ?? result.turn_id)) {
+          firstTurn = false;
           await post('UserPromptSubmit', 'accepted', { turnId: turns.turnId });
           work();
           if (cancelRequested) { cancelRequested = false; cancel(); }
@@ -264,7 +285,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       const delta = payload.delta ?? {};
       if (delta.type === 'text' && typeof delta.text === 'string') output.write(delta.text);
       if (delta.type === 'reasoning' && !reasoning.has(payload.turn_id)) {
-        const line = delta.text?.split(/\r?\n/).find(Boolean);
+        const line = typeof delta.text === 'string' ? delta.text.split(/\r?\n/).find(Boolean) : null;
         if (line) { reasoning.add(payload.turn_id); error.write(`\u001b[2m${line}\u001b[0m\n`); }
       }
       if (delta.type === 'tool_call' && delta.name) {
@@ -282,19 +303,21 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       const subtype = { 'turn.completed': 'end_turn', 'turn.failed': 'error', 'turn.cancelled': 'cancelled' }[event?.type];
       if (!subtype || (turns.turnId && (event.turn_id ?? payload.frame.turn_id) && turns.turnId !== (event.turn_id ?? payload.frame.turn_id))) return;
       await post('Stop', subtype, { turnId: turns.turnId });
+      if (ending) return;
+      activity.stopBeats();
       if (subtype === 'error') await post('Notification', 'runtime_error', { turnId: turns.turnId });
-      await activity.withdrawAll(subtype === 'cancelled' ? 'turn_cancelled' : 'turn_ended');
-      questions.clear();
+      if (subtype === 'cancelled') { await activity.withdrawAll('turn_cancelled'); questions.clear(); }
       turns.end();
       tools.clear(); reasoning.clear(); lastBeat = -Infinity; cancelRequested = false;
       drain();
       return;
     }
     if (payload.type === 'organism.questions') {
-      const fresh = new Map((payload.questions ?? []).map(question => [question.question_id, question]));
+      if (!Array.isArray(payload.questions)) return;
+      const fresh = new Map(payload.questions.filter(question => question && typeof question === 'object' && typeof question.question_id === 'string' && (!question.session_id || question.session_id === nativeRef)).map(question => [question.question_id, question]));
       for (const [id, entry] of questions) if (!fresh.has(id)) {
         questions.delete(id);
-        void entry.handle?.withdraw?.('turn_ended');
+        if (!entry.answered) void entry.handle?.withdraw?.('turn_ended');
       }
       for (const [id, question] of fresh) {
         if (questions.has(id)) continue;
@@ -308,22 +331,24 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   try { child = spawn(args[0], args.slice(1), { cwd: workspace, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] }); }
   catch (cause) { note(`could not start nodecode: ${cause.message}`); await finish(127); return done; }
   const framer = createFramer(frame => {
-    frameChain = frameChain.then(() => handleFrame(frame)).catch(cause => { note(`frame error: ${cause.message}`); return finish(2, { kill: true }); });
+    frameChain = frameChain.then(() => handleFrame(frame)).catch(cause => { note(`frame error: ${cause.message}`); });
   }, line => error.write(`${line}\n`));
   child.stdout.on('data', framer);
   child.stdout.on('end', () => framer.end());
   child.stderr.on('data', chunk => error.write(chunk));
-  child.stdin.on('error', cause => { if (!ending && cause.code !== 'EPIPE') note(`stdin: ${cause.message}`); });
+  function streamError(cause) { if (!ending) { if (cause.code !== 'EPIPE') note(`stream: ${cause.message}`); void finish(cause.code === 'EPIPE' ? 0 : 1, { kill: true }); } }
+  child.stdin.on('error', streamError);
+  output.on('error', streamError); input.on('error', streamError);
   child.on('error', cause => { note(`could not start nodecode: ${cause.message}`); void finish(127); });
   child.on('close', code => { frameChain.finally(() => finish(code ?? 1)); });
   if (input.isTTY) {
     input.setRawMode(true);
     output.write('\u001b[?2004h');
-    rawHandler = createInputParser(submit, value => output.write(value), interrupt);
+    rawHandler = createInputParser(submit, value => output.write(value), interrupt, () => [...questions.values()].some(entry => !entry.answered && (!Array.isArray(entry.question.choices) || !entry.question.choices.length)));
     input.on('data', rawHandler);
   } else {
     inputInterface = readline.createInterface({ input, crlfDelay: Infinity });
-    inputInterface.on('line', line => { if (line.trim()) submit(line); });
+    inputInterface.on('line', line => { if (line.trim() || [...questions.values()].some(entry => !entry.answered && (!Array.isArray(entry.question.choices) || !entry.question.choices.length))) submit(line); });
     inputInterface.on('close', onInputEnd);
   }
   input.on('end', onInputEnd);

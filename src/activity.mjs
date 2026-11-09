@@ -15,13 +15,19 @@ function endpointFor(env) {
 }
 
 /** Activity failures never prevent the native session from running. */
-export function createActivity({ env = process.env, fetchImpl = globalThis.fetch, now = Date.now } = {}) {
+export function createActivity({ env = process.env, fetchImpl = globalThis.fetch, now = Date.now, sleep = (ms, signal) => new Promise(resolve => {
+  const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
+  const timer = setTimeout(done, ms);
+  signal?.addEventListener('abort', done, { once: true });
+  if (signal?.aborted) done();
+}) } = {}) {
   const endpoint = endpointFor(env);
   const identity = { sessionName: env.OPENRIG_SESSION_NAME, nodeId: env.OPENRIG_NODE_ID, generation: env.OPENRIG_OCCUPANT_GENERATION, runtime: env.OPENRIG_RUNTIME || 'nodecode' };
   const asks = new Set();
   let sequence = 0;
   let chain = Promise.resolve();
   let beat;
+  let lastWorkBeat = -Infinity;
   const occurredAt = () => new Date(now()).toISOString();
   const call = async (method, route, body, timeout = 2_000, signal) => {
     if (!endpoint) return null;
@@ -42,6 +48,10 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
   };
   const post = (hookEvent, subtype, extra = {}) => {
     if (!endpoint) return Promise.resolve();
+    if (hookEvent === 'active' && subtype === 'liveness') {
+      if (now() - lastWorkBeat < 10_000) return Promise.resolve();
+      lastWorkBeat = now();
+    }
     return enqueue('/api/activity/hooks', { ...extra, ...identity, sequence: ++sequence, hookEvent, subtype, occurredAt: occurredAt() });
   };
   const stopBeats = () => { clearInterval(beat); beat = undefined; };
@@ -54,13 +64,13 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
     if (endpoint) beat = setInterval(() => { if (!asks.size) void post('active', 'liveness', { turnId, livenessSeconds: 30 }); }, 10_000).unref();
   };
   const ask = ({ question, sessionName = identity.sessionName, nodeId = identity.nodeId, generation = identity.generation, nativeRef, turnId, onAnswer } = {}) => {
-    if (!endpoint) return Promise.resolve();
+    if (!endpoint || !Array.isArray(question?.choices) || !question.choices.length) return Promise.resolve();
     const controller = new AbortController();
     const state = { ended: false, askId: null, reason: null, withdrawal: null };
     const withdraw = reason => {
       if (state.ended) return state.withdrawal || Promise.resolve();
       state.ended = true; state.reason = reason; controller.abort(); asks.delete(state);
-      if (state.askId) state.withdrawal = enqueue(`/api/activity/permission-requests/${encodeURIComponent(state.askId)}/withdraw`, { reason });
+      if (state.askId && !state.answered) state.withdrawal = enqueue(`/api/activity/permission-requests/${encodeURIComponent(state.askId)}/withdraw`, { reason });
       return state.withdrawal || Promise.resolve();
     };
     state.withdraw = withdraw;
@@ -81,21 +91,32 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
         return;
       }
       let answer = submitted;
+      let failureSince = null, backoff = 250;
       while (!state.ended) {
         if (answer?.state === 'answered' || answer?.state === 'permitted') {
+          state.answered = true;
           const option = options.find(item => item.optionId === answer.optionId);
           if (option) {
-            await onAnswer?.(option.name);
-            if (!state.ended) await post('active', 'permission_resolved', { turnId, ...(state.askId ? { askId: state.askId } : {}) });
+            const written = await onAnswer?.(option.name);
+            const ended = state.ended;
+            state.ended = true; asks.delete(state);
+            if (written && !ended) await post('active', 'permission_resolved', { turnId, ...(state.askId ? { askId: state.askId } : {}) });
           } else manual();
           return;
         }
-        if (!state.askId || !answer || ['refused', 'withdrawn', 'stale'].includes(answer.state)) {
+        if (!answer && state.askId) {
+          failureSince ??= now();
+          const remaining = 120_000 - (now() - failureSince);
+          if (remaining <= 0) { manual(); state.keep = true; return; }
+          await sleep(Math.min(backoff, remaining), controller.signal);
+          backoff = Math.min(backoff * 2, 5000);
+          if (state.ended) return;
+        } else if (!state.askId || ['refused', 'withdrawn', 'stale'].includes(answer.state)) {
           if (!answer || !state.askId || answer.state === 'refused') manual();
           if (!answer && state.askId) state.keep = true;
           return;
-        }
-        answer = await call('GET', `/api/activity/permission-requests/${encodeURIComponent(state.askId)}?waitSeconds=25`, null, 35_000, controller.signal);
+        } else { failureSince = null; backoff = 250; }
+        answer = await call('GET', `/api/activity/permission-requests/${encodeURIComponent(state.askId)}?waitSeconds=25`, null, failureSince === null ? 35_000 : Math.max(1, Math.min(35_000, 120_000 - (now() - failureSince))), controller.signal);
       }
     })().finally(() => { if (!state.keep) asks.delete(state); });
     task.withdraw = withdraw;

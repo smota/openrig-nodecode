@@ -1,8 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
+
+function startGateway(program, args, options) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(program, args, { ...options, detached: true, stdio: 'ignore' });
+    child.once('error', reject);
+    child.once('spawn', () => { child.unref(); resolve(); });
+  });
+}
 
 function ownerFile(home, store) {
   if (store) return `${store}.owner`;
@@ -20,7 +27,7 @@ async function bounded(operation, timeout) {
 }
 
 /** Only the gateway's explicit unknown_session response proves a resume is missing. */
-export async function probeSession({ ref, home = process.env.NODECODE_HOME || path.join(os.homedir(), '.nodecode'), store, profile, exec = promisify(execFile), fetchImpl = globalThis.fetch, timeoutMs = 15_000 }) {
+export async function probeSession({ ref, home = process.env.NODECODE_HOME || path.join(os.homedir(), '.nodecode'), store, profile, exec = startGateway, fetchImpl = globalThis.fetch, timeoutMs = 15_000, allowStart = true }) {
   const deadline = Date.now() + Math.max(0, timeoutMs);
   let started = false;
   do {
@@ -29,6 +36,9 @@ export async function probeSession({ ref, home = process.env.NODECODE_HOME || pa
     const remaining = Math.max(1, deadline - Date.now());
     let owner;
     try { owner = JSON.parse(fs.readFileSync(ownerFile(home, store), 'utf8')); } catch { /* gateway may be starting */ }
+    if (Number.isInteger(owner?.pid) && owner.pid > 0) {
+      try { process.kill(owner.pid, 0); } catch (cause) { if (cause.code === 'ESRCH') owner = null; }
+    }
     if (owner && Number.isInteger(owner.port) && owner.port > 0 && owner.port <= 65535) {
       try {
         const result = await bounded(async () => {
@@ -41,9 +51,15 @@ export async function probeSession({ ref, home = process.env.NODECODE_HOME || pa
         if (result) return result;
       } catch { /* transport failures never mean missing */ }
     } else if (!started) {
+      if (process.env.OPENRIG_LAUNCH_WRAPPER !== undefined) {
+        process.stderr.write('nodecode: gateway bootstrap disabled by launch wrapper\n');
+        return 'unreachable';
+      }
+      if (!allowStart) return 'unreachable';
       started = true;
       try {
-        await bounded(() => exec(process.env.NODECODE_BIN || 'nodecode', [...(profile ? ['-p', profile] : []), 'gateway', 'on'], { timeout: remaining, env: { ...process.env, NODECODE_HOME: home } }), remaining);
+        const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('OPENRIG_')));
+        await bounded(() => exec(process.env.NODECODE_BIN || 'nodecode', [...(profile ? ['-p', profile] : []), 'gateway', 'on'], { timeout: remaining, env: { ...env, NODECODE_HOME: home } }), remaining);
       } catch { /* retry discovery even if the starter failed */ }
     }
     const delay = Math.min(100, deadline - Date.now());

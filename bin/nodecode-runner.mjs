@@ -105,7 +105,8 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
         try { firstInput = fs.readFileSync(env.OPENRIG_FIRST_INPUT, 'utf8'); }
         catch (cause) { note(`first input: ${cause.message}`); }
       }
-      firstPrompt = composeFirstPrompt(firstInput, opts.startupFiles);
+      // A standalone first-input handoff is byte-preserving; composition may trim.
+      firstPrompt = opts.startupFiles.length ? composeFirstPrompt(firstInput, opts.startupFiles) : firstInput;
     }
   } catch (cause) { note(cause.message); return 2; }
   const args = nodecodeArgv({ bin, profile: opts.profile, store: opts.store, resumeRef, extra: opts.nodecodeArgs, wrapper });

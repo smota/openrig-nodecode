@@ -41,6 +41,7 @@ Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
 | --- | --- |
 | `OPENRIG_LAUNCH_WRAPPER` | JSON argv array applied to the nodecode child. Stripped from the child env. Malformed JSON exits 2 before spawn. Never starts unwrapped. |
 | `OPENRIG_SESSION_NAME` | Seat name `<pod>-<member>@<rig>`. |
+| `OPENRIG_NODECODE_NO_ANSWERS` | Test-only failure hook: `1` skips the answer subscription. Default launches always subscribe to questions for their native session before starting a turn. |
 | `OPENRIG_NODECODE_RESUME_POLICY` | Resume policy: `head` (default) or `last-completed`; overridden by `--resume-policy`. |
 | `OPENRIG_RESUME_REF` | Resume this nodecode session. Probed before spawn. |
 | `OPENRIG_MODEL` | `[provider/]model[:effort]` on the first turn of a fresh launch only. |
@@ -86,7 +87,7 @@ The cell exposes `rig_whoami`, `rig_queue_*`, `rig_send` and `rig_capture` as na
 
 ## Verification
 
-Proved against nodecode 98dd6dc80 and OpenRig 0.7.1 (`npm test`: 72/72 unit, node:test, fake and native; plus 6 opt-in live steps via `npm run test:live`):
+Proved against nodecode 98dd6dc80 and OpenRig 0.7.1 (unit, fake and native tests via `npm test`; plus opt-in live steps via `npm run test:live`):
 
 | Seam | Proof |
 |---|---|
@@ -98,7 +99,17 @@ Proved against nodecode 98dd6dc80 and OpenRig 0.7.1 (`npm test`: 72/72 unit, nod
 
 | Live rig (`npm run test:live`) | installed daemon, throwaway `rig create --runtime nodecode`: real model writes a file via `rig send`; `rig down --snapshot` + `rig launch` resumes the same session and the model recalls prior context; unknown runtime refused |
 
-Not proved: behaviour under tmux pane loss/daemon restart mid-turn; permission bridge against a real question prompt (fake-nodecode only).
+The opt-in native question proof (`OPENRIG_NATIVE_QUESTIONS=1 node --test --test-name-pattern='native operator question' tests/native.test.mjs`) uses fresh throwaway homes, stores and workspaces, copied provider config/credentials, and a fake OpenRig HTTP endpoint. A model prompt asks the native evaluator to run exactly:
+
+```lisp
+(multiple-value-list (ask-operator "openrig-test" :choices '("Allow" "Deny") :seconds 30))
+```
+
+The successful native run posted title `openrig-test` and choices `Allow`/`Deny`, took `Allow` through the endpoint poll response, and printed `("Allow" :ANSWERED)`. With the test-only subscription suppression hook it posted no permission requests and printed `My form was truncated; retrying with the full form.(NIL :NOBODY)`. This exercises native question delivery and answering through a fake endpoint; it does not exercise the installed OpenRig daemon's permission UI. Because the trigger is a model prompt, a run can fail on a model-side turn error (seen once in three runs: empty output, `runtime_error` hook); rerun before reading it as a bridge failure.
+
+This is model-prompt evidence, not deterministic gateway form evaluation: the installed gateway protocol has no direct form-evaluation command. Of two focused attempts, the first produced empty final text and zero requests in both modes (both failed); the second passed both modes. The native question proof therefore remains opt-in and gives each run a 120-second deadline with process/server/temp cleanup. The default regression checks the exact subscription frame and its ordering before the first turn.
+
+Not proved: behaviour under tmux pane loss/daemon restart mid-turn.
 
 ## Live rig proof
 

@@ -72,6 +72,32 @@ async function runner(t, { frames = [resumed()], onCommand = [], setup = () => {
 
 const closeOnReady = (h, { input }) => { if (h.subtype === 'nodecode_ready') input.end(); };
 
+test('answers subscription declares the native session before the first turn', async t => {
+  const r = await runner(t, {
+    frames: [resumed({ session_id: 'native-answers' }), resumed({ session_id: 'native-answers' })],
+    onCommand: [{ type: 'start_turn', frames: [result(), ended()] }],
+    start({ input }) { input.end('hello\n'); },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.commands[0], {
+    type: 'set_session_subscriptions', answers: true, subscriptions: ['native-answers'], pid: process.pid,
+  });
+  assert.equal(r.commands[1].type, 'start_turn');
+  assert.equal(r.commands.filter(c => c.type === 'set_session_subscriptions').length, 1);
+  assert.equal(r.stderr.split('answers: subscribed').length - 1, 1);
+});
+
+test('test-only NO_ANSWERS hook suppresses the subscription', async t => {
+  const r = await runner(t, {
+    env: { OPENRIG_NODECODE_NO_ANSWERS: '1' },
+    onCommand: [{ type: 'start_turn', frames: [result(), ended()] }],
+    start({ input }) { input.end('hello\n'); },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.commands.map(c => c.type), ['start_turn']);
+  assert.doesNotMatch(r.stderr, /answers: subscribed/);
+});
+
 test('1 profile resume reads the profile owner and token, not the default gateway', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'profile-root-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   t.mock.method(os, 'homedir', () => dir);
@@ -117,16 +143,16 @@ test('3 poll recovers from transient HTTP errors and gives up only after the ret
     if (++polls === 1) { res.writeHead(503); res.end('temporary'); return; }
     return { state: 'answered', optionId: 'choice-1' };
   }, onCommand: [{ type: 'answer_question', frames: [question([])] }], onHook(h, { input }) { if (h.subtype === 'permission_resolved') input.end(); } });
-  assert.equal(r.code, 0, r.stderr); assert.equal(polls, 2); assert.equal(r.commands[0].answer, 'No');
+  assert.equal(r.code, 0, r.stderr); assert.equal(polls, 2); assert.equal(r.commands.filter(c => c.type !== 'set_session_subscriptions')[0].answer, 'No');
 });
 
 test('4 free text questions are answered from TTY and never posted as permission requests', async t => {
   const r = await runner(t, { tty: true, frames: [resumed(), [40, question([{ question_id: 'text', title: 'Your answer?' }])]], onCommand: [{ type: 'answer_question', frames: [question([])] }], start({ input }) { setTimeout(() => input.write('anything typed\r'), 150); setTimeout(() => input.end(), 250); } });
   assert.equal(r.code, 0, r.stderr); assert.match(r.stderr, /Your answer/);
-  assert.equal(r.commands[0].answer, 'anything typed'); assert.equal(r.requests.some(r => r.url === '/api/activity/permission-requests'), false);
+  assert.equal(r.commands.filter(c => c.type !== 'set_session_subscriptions')[0].answer, 'anything typed'); assert.equal(r.requests.some(r => r.url === '/api/activity/permission-requests'), false);
   for (const [tty, typed] of [[true, ''], [false, ''], [true, '/abort']]) {
     const blank = await runner(t, { tty, frames: [resumed(), question([{ question_id: 'text', title: 'Blank is allowed', choices: [] }])], onCommand: [{ type: 'answer_question', frames: [question([])] }], start({ input }) { setTimeout(() => input.write(typed + '\n'), 100); setTimeout(() => input.end(), 180); } });
-    assert.equal(blank.code, 0, blank.stderr); assert.equal(blank.commands[0].answer, typed); assert.equal(blank.requests.some(r => r.url === '/api/activity/permission-requests'), false);
+    assert.equal(blank.code, 0, blank.stderr); assert.equal(blank.commands.filter(c => c.type !== 'set_session_subscriptions')[0].answer, typed); assert.equal(blank.requests.some(r => r.url === '/api/activity/permission-requests'), false);
   }
 });
 
@@ -188,7 +214,7 @@ test('11 relative store is resolved once for probe and RPC spawn', async t => {
   const r = await runner(t, { argv: ['--store', store], env: { OPENRIG_RESUME_REF: 'ref' }, setup({ api, env }) { fs.writeFileSync(owner, JSON.stringify({ pid: process.pid, port: api.port })); env.NODE_OPTIONS = ''; }, onHook: closeOnReady,
   });
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(r.commands.length, 0);
+  assert.equal(r.commands.filter(c => c.type !== 'set_session_subscriptions').length, 0);
   assert.equal(JSON.parse(fs.readFileSync(path.join(r.dir, 'argv')))[1], path.resolve(store));
 });
 
@@ -279,9 +305,9 @@ process.stdout.write(JSON.stringify({ code, raw: input.raw, returnedBeforeError,
 test('15 rejected first start retains model fields until an accepted start', async t => {
   let ends = 0;
   const r = await runner(t, { env: { OPENRIG_MODEL: 'provider/model:high' }, frames: [resumed()], onCommand: [{ type: 'start_turn', prompt: 'one', frames: [result('rejected')] }, { type: 'start_turn', prompt: 'two', frames: [result(), ended()] }, { type: 'start_turn', prompt: 'three', frames: [result(), ended()] }], onHook(h, { input }) { if (h.subtype === 'nodecode_ready') input.write('one\ntwo\n'); if (h.subtype === 'end_turn') { if (++ends === 1) input.write('three\n'); else input.end(); } } });
-  assert.equal(r.code, 0, r.stderr); assert.equal(r.commands.length, 3);
-  for (const c of r.commands.slice(0, 2)) assert.deepEqual({ ...c.request, prompt: undefined }, { prompt: undefined, provider: 'provider', model: 'model', effort: 'high' });
-  assert.deepEqual(r.commands[2].request, { prompt: 'three' });
+  assert.equal(r.code, 0, r.stderr); assert.equal(r.commands.filter(c => c.type !== 'set_session_subscriptions').length, 3);
+  for (const c of r.commands.filter(c => c.type !== 'set_session_subscriptions').slice(0, 2)) assert.deepEqual({ ...c.request, prompt: undefined }, { prompt: undefined, provider: 'provider', model: 'model', effort: 'high' });
+  assert.deepEqual(r.commands.filter(c => c.type !== 'set_session_subscriptions')[2].request, { prompt: 'three' });
 });
 
 test('16 bad skills warn, preserve ordinary directories and allow runner launch', async t => {
@@ -307,7 +333,7 @@ test('17 separate main runs use distinct first start command ids', async t => {
       if (h.subtype === 'end_turn') input.end();
     } });
     assert.equal(r.code, 0, r.stderr);
-    ids.push(r.commands[0].command_id);
+    ids.push(r.commands.filter(c => c.type !== 'set_session_subscriptions')[0].command_id);
   }
   assert.notEqual(ids[0], ids[1]);
 });
@@ -326,7 +352,7 @@ test('18 duplicate admissions reject the stale turn and drain queued prompts', a
     } });
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stderr, /command rejected.*old-turn/);
-    assert.deepEqual(r.commands.map(c => c.request.prompt), ['one', 'two']);
+    assert.deepEqual(r.commands.filter(c => c.type !== 'set_session_subscriptions').map(c => c.request.prompt), ['one', 'two']);
     assert.deepEqual(r.hooks.filter(h => h.subtype === 'accepted').map(h => h.turnId), ['turn']);
   });
 });
@@ -420,9 +446,9 @@ for (const [ending, policy, navigate] of [['failed', 'last-completed', true], ['
       start({ input }) { input.end('queued first prompt\n'); },
     });
     assert.equal(r.code, 0, r.stderr);
-    assert.deepEqual(r.commands.map(c => c.type), navigate ? ['navigate_checkpoint', 'start_turn'] : ['start_turn']);
+    assert.deepEqual(r.commands.filter(c => c.type !== 'set_session_subscriptions').map(c => c.type), navigate ? ['navigate_checkpoint', 'start_turn'] : ['start_turn']);
     if (navigate) {
-      assert.equal(r.commands[0].target_turn_id, 'good');
+      assert.equal(r.commands.filter(c => c.type !== 'set_session_subscriptions')[0].target_turn_id, 'good');
       assert.doesNotMatch(r.stderr, /EARLY_START/);
       assert.match(r.stderr, new RegExp(`resume: head moved to turn good \\(last completed; last turn was ${ending}\\)`));
     } else assert.doesNotMatch(r.stderr, /head moved/);
@@ -451,7 +477,7 @@ test('checkpoint resume policy from env applies only to a verified resume', asyn
       onHook: closeOnReady,
     });
     assert.equal(r.code, 0, r.stderr);
-    assert.deepEqual(r.commands.map(c => c.type), resume ? ['navigate_checkpoint'] : []);
+    assert.deepEqual(r.commands.filter(c => c.type !== 'set_session_subscriptions').map(c => c.type), resume ? ['navigate_checkpoint'] : []);
     assert.equal(r.requests.some(r => r.url.endsWith('/checkpoints')), resume);
   }
 });

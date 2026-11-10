@@ -165,7 +165,13 @@ test('resume probes gateway with owner port and operator token, then sends no fi
   assert.equal(result.code, 0, result.stderr);
   assert.equal(result.record.nativeRef, ref);
   assert.deepEqual(result.spawned.argv, ['rpc', ref]);
-  assert.deepEqual(result.stdin, []);
+  assert.equal(result.stdin.length, 1);
+  const subscription = result.stdin[0];
+  assert.ok(Number.isInteger(subscription.pid) && subscription.pid > 0);
+  assert.notEqual(subscription.pid, process.pid);
+  assert.deepEqual(subscription, {
+    type: 'set_session_subscriptions', answers: true, subscriptions: [ref], pid: subscription.pid,
+  });
   const probe = result.requests.find(r => r.url === `/api/gateway/sessions/${ref}/header`);
   assert.equal(probe.method, 'GET');
   assert.equal(probe.headers.authorization, 'Bearer gateway-test-token');

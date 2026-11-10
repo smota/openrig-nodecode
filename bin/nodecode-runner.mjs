@@ -287,6 +287,10 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       nativeRef = frame.session_id || payload.session_id || payload.header?.session_id || resumeRef;
       if (resumeRef && nativeRef !== resumeRef) { record({ error: 'missing' }); await finish(3, { kill: true }); return; }
       if (!nativeRef) { note('session replay did not identify a native session'); return; }
+      if (env.OPENRIG_NODECODE_NO_ANSWERS !== '1') {
+        write({ type: 'set_session_subscriptions', answers: true, subscriptions: [nativeRef], pid: process.pid });
+        note('answers: subscribed');
+      }
       const frames = Array.isArray(payload.accumulated_frames) ? payload.accumulated_frames : [];
       for (const value of frames) {
         const frame = value?.frame ?? value;

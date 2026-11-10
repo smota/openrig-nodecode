@@ -12,6 +12,7 @@ import { parseArgs, composeFirstPrompt, launchWrapperArgv, writeLaunchRecord, no
 import { memberOf, placeSkills, linkHomeSkills, linkOpenrigCell } from '../src/skills.mjs';
 import { parseModelSpec } from '../src/model-spec.mjs';
 import { probeSession, readSessionCheckpoints } from '../src/session-probe.mjs';
+import { watchCommandFile } from '../src/command-channel.mjs';
 import { createActivity } from '../src/activity.mjs';
 import { createFramer, createTurnTracker } from '../src/protocol.mjs';
 
@@ -168,6 +169,14 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   let commandNumber = 0, lastInterrupt = 0, lastBeat = -Infinity, cancelRequested = false;
   let frameChain = Promise.resolve();
   let navigationCommand = null;
+  let closeCommands, pendingWake = null, lastText = '', cancelled = false;
+  const wakeReplies = new Set();
+  const replyWake = (id, answer) => {
+    const task = activity.wakeAnswer(id, answer).catch(cause => note(`wake answer: ${cause.message}`));
+    wakeReplies.add(task);
+    void task.finally(() => wakeReplies.delete(task));
+    return task;
+  };
   let resolveDone;
   const done = new Promise(resolve => { resolveDone = resolve; });
   const write = (frame, onWritten) => {
@@ -176,7 +185,8 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     catch (cause) { streamError(cause); return false; }
   };
   const nextCommand = () => `cmd-${commandNonce}-${++commandNumber}`;
-  const cancel = () => {
+  const cancel = (fromChannel = false) => {
+    if (turns.busy && fromChannel) cancelled = true;
     if (turns.turnId) write({ type: 'cancel_turn', command_id: nextCommand(), turn_id: turns.turnId });
     else if (turns.busy) { if (turns.submitted) cancelRequested = true; note('cannot abort yet: active turn has no turn id'); }
   };
@@ -189,8 +199,10 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     const commandId = nextCommand();
     if (!turns.submit(commandId)) { turns.enqueue(prompt); return; }
     const model = !resumeRef && firstTurn ? parseModelSpec(env.OPENRIG_MODEL) : {};
+    lastText = ''; cancelled = false;
     write({ type: 'start_turn', command_id: commandId, request: { prompt, ...model } });
     activity.stopBeats();
+    return commandId;
   };
   const drain = () => {
     if (!ready || ending || resumeCheckpoint || navigationCommand || turns.busy) return;
@@ -254,6 +266,8 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     if (kill) cancel();
     ending = true;
     restoreInput();
+    closeCommands?.();
+    clearTimeout(pendingWake?.timer); pendingWake = null;
     activity.stopBeats();
     questions.clear();
     if (kill && child && child.exitCode === null) {
@@ -262,6 +276,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       force.unref();
     }
     try { await activity.withdrawAll('exited'); } catch (cause) { note(`permission withdrawal: ${cause.message}`); }
+    await Promise.all([...wakeReplies]);
     await activity.post('Stop', 'nodecode_exited');
     for (const stream of [output, input]) {
       if (stream.closed) stream.off('error', streamError);
@@ -334,6 +349,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
         note(`command rejected: ${JSON.stringify(result)}`);
         if (startResult && turns.reject(commandId)) {
           cancelRequested = false;
+          if (pendingWake && pendingWake.commandId === commandId) { clearTimeout(pendingWake.timer); pendingWake = null; }
           if (!turns.busy && !turns.queue.length) await post('Stop', 'error');
           drain();
         }
@@ -351,7 +367,11 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     if (payload.type === 'item_delta') {
       turns.observe(payload.turn_id);
       const delta = payload.delta ?? {};
-      if (delta.type === 'text' && typeof delta.text === 'string') output.write(delta.text);
+      if (delta.type === 'text' && typeof delta.text === 'string') {
+        if (!payload.turn_id || !turns.turnId || payload.turn_id === turns.turnId) lastText = delta.text;
+        if (pendingWake && pendingWake.commandId === turns.commandId && (!payload.turn_id || !turns.turnId || payload.turn_id === turns.turnId)) pendingWake.text = (pendingWake.text + delta.text).slice(0, 2000);
+        output.write(delta.text);
+      }
       if (delta.type === 'reasoning' && !reasoning.has(payload.turn_id)) {
         const line = typeof delta.text === 'string' ? delta.text.split(/\r?\n/).find(Boolean) : null;
         if (line) { reasoning.add(payload.turn_id); error.write(`\u001b[2m${line}\u001b[0m\n`); }
@@ -368,15 +388,20 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     }
     if (payload.type === 'session_stream_event') {
       const event = payload.frame?.event;
-      const subtype = { 'turn.completed': 'end_turn', 'turn.failed': 'error', 'turn.cancelled': 'cancelled' }[event?.type];
+      let subtype = { 'turn.completed': 'end_turn', 'turn.failed': 'error', 'turn.cancelled': 'cancelled' }[event?.type];
       if (!subtype || (turns.turnId && (event.turn_id ?? payload.frame.turn_id) && turns.turnId !== (event.turn_id ?? payload.frame.turn_id))) return;
-      await post('Stop', subtype, { turnId: turns.turnId });
+      if (cancelled) subtype = 'cancelled';
+      await post('Stop', subtype, { turnId: turns.turnId, ...(subtype === 'cancelled' ? { reason: 'cancelled' } : {}) });
+      if (pendingWake && pendingWake.commandId === turns.commandId) {
+        const wake = pendingWake; pendingWake = null; clearTimeout(wake.timer);
+        if (subtype === 'end_turn') void replyWake(wake.id, wake.text);
+      }
       if (ending) return;
       activity.stopBeats();
       if (subtype === 'error') await post('Notification', 'runtime_error', { turnId: turns.turnId });
       if (subtype === 'cancelled') { await activity.withdrawAll('turn_cancelled'); questions.clear(); }
       turns.end();
-      tools.clear(); reasoning.clear(); lastBeat = -Infinity; cancelRequested = false;
+      tools.clear(); reasoning.clear(); lastBeat = -Infinity; cancelRequested = false; cancelled = false;
       drain();
       return;
     }
@@ -427,6 +452,24 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     signalHandlers.set(signal, handler); process.on(signal, handler);
   }
   signalHandlers.set('SIGINT', interrupt); process.on('SIGINT', interrupt);
+  if (env.OPENRIG_COMMAND_PATH) closeCommands = watchCommandFile(env.OPENRIG_COMMAND_PATH, command => {
+    if (ending || !command || typeof command !== 'object') return;
+    if (command.type === 'cancel') { cancel(true); return; }
+    if (command.type !== 'wake' || typeof command.id !== 'string' || typeof command.question !== 'string') return;
+    if (turns.busy || !ready || navigationCommand) {
+      void replyWake(command.id, `busy: ${lastText.replace(/\s+/g, ' ').trim().slice(0, 300)}`);
+      return;
+    }
+    const seconds = Number.isFinite(command.timeoutSeconds) ? Math.max(0, Math.min(300, command.timeoutSeconds)) : 60;
+    const commandId = start(command.question);
+    const wake = { id: command.id, commandId, text: '', timer: null };
+    pendingWake = wake;
+    wake.timer = setTimeout(() => {
+      if (pendingWake !== wake) return;
+      pendingWake = null;
+      if (turns.commandId === commandId) cancel(true);
+    }, seconds * 1000).unref();
+  }, note);
   return done;
 }
 

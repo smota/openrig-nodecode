@@ -532,3 +532,103 @@ test('--no-openrig-cell skips linking and preserves an existing cell', async t =
     assert.doesNotMatch(r.stderr, /sam-openrig/);
   }
 });
+
+const commandSetup = context => {
+  context.env.OPENRIG_COMMAND_PATH = path.join(context.dir, 'commands.jsonl');
+  fs.writeFileSync(context.env.OPENRIG_COMMAND_PATH, '');
+};
+const appendCommand = (env, command) => fs.appendFileSync(env.OPENRIG_COMMAND_PATH, JSON.stringify({ id: 'wake-1', at: new Date().toISOString(), ...command }) + '\n');
+
+test('command channel cancels the active turn and posts Stop cancelled', async t => {
+  let env;
+  const r = await runner(t, {
+    setup(context) { commandSetup(context); env = context.env; },
+    onCommand: [{ type: 'start_turn', frames: [result()] }, { type: 'cancel_turn', frames: [ended()] }],
+    onHook(h, { input }) {
+      if (h.subtype === 'nodecode_ready') input.write('work\n');
+      if (h.subtype === 'accepted') appendCommand(env, { type: 'cancel' });
+      if (h.subtype === 'cancelled') input.end();
+    },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.commands.map(c => c.type), ['start_turn', 'cancel_turn']);
+  assert.equal(r.hooks.find(h => h.subtype === 'cancelled').reason, 'cancelled');
+});
+
+test('command channel idle wake starts a turn and posts its completed text', async t => {
+  let env;
+  const r = await runner(t, {
+    env: { OPENRIG_OCCUPANT_GENERATION: '7' },
+    setup(context) { commandSetup(context); env = context.env; },
+    onCommand: [{ type: 'start_turn', frames: [result(), delta({ type: 'text', text: 'fake ' }), delta({ type: 'text', text: 'reply' }), ended()] }],
+    onHook(h, { input }) {
+      if (h.eventFamily === 'session_identity') appendCommand(env, { type: 'wake', question: 'hello?', timeoutSeconds: 2 });
+      if (h.eventFamily === 'wake_answer') input.end();
+    },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.commands[0].request.prompt, 'hello?');
+  const answer = r.hooks.find(h => h.eventFamily === 'wake_answer');
+  assert.deepEqual({ ...answer, occurredAt: undefined }, { eventFamily: 'wake_answer', id: 'wake-1', answer: 'fake reply', sessionName: 'pod-worker@rig', nodeId: 'node', generation: '7', occurredAt: undefined });
+  assert.ok(Number.isFinite(Date.parse(answer.occurredAt)));
+});
+
+test('command channel busy wake returns one-line status without a new turn', async t => {
+  let env;
+  const r = await runner(t, {
+    setup(context) { commandSetup(context); env = context.env; },
+    onCommand: [{ type: 'start_turn', frames: [result(), delta({ type: 'text', text: 'working\n' + 'x'.repeat(400) })] }, { type: 'cancel_turn', frames: [ended()] }],
+    onHook(h, { input }) {
+      if (h.subtype === 'nodecode_ready') input.write('work\n');
+      if (h.subtype === 'liveness') appendCommand(env, { type: 'wake', question: 'status?' });
+      if (h.eventFamily === 'wake_answer') { appendCommand(env, { type: 'cancel' }); input.end(); }
+    },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.commands.filter(c => c.type === 'start_turn').length, 1);
+  assert.equal(r.hooks.find(h => h.eventFamily === 'wake_answer').answer, 'busy: ' + ('working ' + 'x'.repeat(400)).slice(0, 300));
+});
+
+test('command channel ignores malformed lines once and buffers partial UTF-8 lines', async t => {
+  const { watchCommandFile } = await import('../src/command-channel.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'command-tail-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'commands'); fs.writeFileSync(file, 'bad\nalso bad\n');
+  const notes = []; const commands = [];
+  const close = watchCommandFile(file, value => commands.push(value), note => notes.push(note)); t.after(close);
+  const bytes = Buffer.from(JSON.stringify({ type: 'wake', question: 'café' }) + '\n');
+  const cut = bytes.indexOf(Buffer.from('é')) + 1;
+  fs.appendFileSync(file, bytes.subarray(0, cut)); await pause(40);
+  assert.deepEqual(commands, []);
+  fs.appendFileSync(file, bytes.subarray(cut)); await pause(1100);
+  assert.deepEqual(commands, [{ type: 'wake', question: 'café' }]); assert.equal(notes.length, 1);
+  assert.equal(fs.readFileSync(file).subarray(0, 13).toString(), 'bad\nalso bad\n');
+});
+
+test('command channel wake deadline cancels without publishing a late answer', async t => {
+  let env;
+  const r = await runner(t, {
+    setup(context) { commandSetup(context); env = context.env; },
+    onCommand: [{ type: 'start_turn', frames: [result()] }, { type: 'cancel_turn', frames: [delta({ type: 'text', text: 'too late' }), ended()] }],
+    onHook(h, { input }) {
+      if (h.eventFamily === 'session_identity') appendCommand(env, { type: 'wake', question: 'slow?', timeoutSeconds: 0.05 });
+      if (h.subtype === 'cancelled') input.end();
+    },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.commands.map(c => c.type), ['start_turn', 'cancel_turn']);
+  assert.equal(r.hooks.some(h => h.eventFamily === 'wake_answer'), false);
+});
+
+test('command channel wake answer is bounded and excludes another turn text', async t => {
+  let env;
+  const r = await runner(t, {
+    setup(context) { commandSetup(context); env = context.env; },
+    onCommand: [{ type: 'start_turn', frames: [result(), { payload: { type: 'item_delta', turn_id: 'stale', delta: { type: 'text', text: 'foreign' } } }, delta({ type: 'text', text: 'x'.repeat(2500) }), ended()] }],
+    onHook(h, { input }) {
+      if (h.eventFamily === 'session_identity') appendCommand(env, { type: 'wake', question: 'long?' });
+      if (h.eventFamily === 'wake_answer') input.end();
+    },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.hooks.find(h => h.eventFamily === 'wake_answer').answer, 'x'.repeat(2000));
+});

@@ -47,6 +47,7 @@ Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
 | `OPENRIG_MODEL` | `[provider/]model[:effort]` on the first turn of a fresh launch only. |
 | `OPENRIG_LAUNCH_ATTEMPT` | Attempt id written into the launch record. |
 | `OPENRIG_LAUNCH_RESULT` | Path of the launch-result record. |
+| `OPENRIG_COMMAND_PATH` | Append-only JSONL command channel supplied by the daemon. |
 | `OPENRIG_FIRST_INPUT` | Path of the first prompt. Fresh launch only. |
 | `OPENRIG_HOME` | OpenRig home. |
 | `OPENRIG_URL` or `OPENRIG_HOST` + `OPENRIG_PORT` | OpenRig base URL. |
@@ -57,6 +58,10 @@ Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
 | `OPENRIG_NODECODE_SEAT_PROFILE` | Fallback for `--seat-profile`; default `none`. |
 | `NODECODE_BIN` | Nodecode binary. Default `nodecode` on `PATH`. |
 | `NODECODE_HOME` | Nodecode home. Default `~/.nodecode`. Selected profiles resolve to `~/.nodecode/profiles/NAME` (Nodecode ignores `NODECODE_HOME` for profiles); skills link from `~/.nodecode/profiles/NAME` when that directory exists. |
+
+## Command channel
+
+The preset declares `commands: true`. When `OPENRIG_COMMAND_PATH` is set, the runner tails complete JSON lines using `fs.watch` and a one-second poll fallback, without truncating the file. A `cancel` command cancels the active turn and posts Stop with reason `cancelled`. A `wake` command answers immediately with `busy: ` plus the latest one-line text delta (up to 300 characters) while busy; when idle it starts the question as a turn and posts its completed text (up to 2000 characters) as a `wake_answer` activity hook carrying the command id and seat identity. The wake deadline defaults to 60 seconds and is capped at 300; expired wake turns are cancelled and the daemon handles the timeout response. Malformed lines are skipped with one note.
 
 ## Openrig cell
 

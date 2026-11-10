@@ -9,6 +9,7 @@ limits:
   - node on pane PATH
 launch_result: true
 runner: true
+commands: true
 resume: true
 first_input: true
 passes_model: true

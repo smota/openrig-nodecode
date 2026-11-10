@@ -2,6 +2,26 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
+const allowWords = new Set(['allow', 'yes', 'y', 'ok', 'okay', 'approve', 'accept', 'permit', 'continue', 'proceed', 'grant', 'run']);
+const rejectWords = new Set(['deny', 'no', 'n', 'reject', 'refuse', 'decline', 'block', 'cancel', 'stop', 'abort', 'skip']);
+const alwaysWords = new Set(['always', 'all', 'session', 'every', 'remember']);
+
+export function classifyChoice(name) {
+  const normalized = name.toLowerCase().trim().replace(/[’']/g, '').replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const words = normalized.split(' ');
+  const allow = words.some(word => allowWords.has(word));
+  const reject = words.some(word => rejectWords.has(word));
+  if (allow === reject) return null;
+  const negated = /^(?:dont|do not|never)\b/.test(normalized);
+  const always = words.some(word => alwaysWords.has(word)) || /\bdont ask again\b/.test(normalized);
+  return `${reject || (allow && negated) ? 'reject' : 'allow'}_${always ? 'always' : 'once'}`;
+}
+
+export function classifyChoices(names) {
+  const kinds = names.map(classifyChoice);
+  return kinds.includes(null) || new Set(kinds).size !== kinds.length ? null : kinds;
+}
+
 function endpointFor(env) {
   let baseUrl = env.OPENRIG_URL || (env.OPENRIG_PORT ? `http://${env.OPENRIG_HOST || '127.0.0.1'}:${env.OPENRIG_PORT}` : '');
   let token = env.OPENRIG_ACTIVITY_HOOK_TOKEN || '';
@@ -88,7 +108,8 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
       const choices = Array.isArray(question?.choices) ? question.choices.slice(0, 4) : [];
       if (question?.choices?.length > 4) process.stderr.write('nodecode: permission bridge offers only the first four choices\n');
       const manual = () => process.stderr.write(`nodecode question: ${question?.title || 'Question'}${question?.detail ? `\n${question.detail}` : ''}\n${(question?.choices || []).join('\n')}\nType the exact choice to answer.\n`);
-      const kinds = ['allow_once', 'reject_once', 'allow_always', 'reject_always'];
+      const kinds = classifyChoices(choices);
+      if (kinds === null) { manual(); return; }
       const options = choices.map((name, index) => ({ optionId: `choice-${index}`, name, kind: kinds[index] }));
       const submitted = await enqueue('/api/activity/permission-requests', {
         sessionName, nodeId, generation, nativeRef, turnId, requestId: question?.question_id,

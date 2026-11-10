@@ -9,6 +9,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { main } from '../bin/nodecode-runner.mjs';
 import { createActivity } from '../src/activity.mjs';
+import * as activityModule from '../src/activity.mjs';
 import { probeSession } from '../src/session-probe.mjs';
 import * as skills from '../src/skills.mjs';
 import { placeSkills, linkHomeSkills } from '../src/skills.mjs';
@@ -145,6 +146,60 @@ test('3 poll recovers from transient HTTP errors and gives up only after the ret
   }, onCommand: [{ type: 'answer_question', frames: [question([])] }], onHook(h, { input }) { if (h.subtype === 'permission_resolved') input.end(); } });
   assert.equal(r.code, 0, r.stderr); assert.equal(polls, 2); assert.equal(r.commands.filter(c => c.type !== 'set_session_subscriptions')[0].answer, 'No');
 });
+
+test('permission choice classifiers read meaning and reject ambiguity', () => {
+  const cases = [
+    ['Allow once', 'allow_once'], ['Deny', 'reject_once'], ["Don't allow", 'reject_once'],
+    ['Do not permit', 'reject_once'], ['Never run', 'reject_once'], ['No, cancel', 'reject_once'],
+    ['Yes, always', 'allow_always'], ['Allow for this session', 'allow_always'],
+    ['Deny always', 'reject_always'], ['  OKAY!  ', 'allow_once'], ['Y', 'allow_once'],
+    ['N', 'reject_once'], ['Approve all', 'allow_always'], ['Block every request', 'reject_always'],
+    ["Allow, don't ask again", 'allow_always'], ['Allow and deny', null], ['Red', null],
+    ['allowance', null], ['nobody', null], ["Don't allow or deny", null],
+  ];
+  assert.equal(typeof activityModule.classifyChoice, 'function');
+  for (const [name, expected] of cases) assert.equal(activityModule.classifyChoice(name), expected, name);
+  assert.deepEqual(activityModule.classifyChoices(['Deny', 'Allow']), ['reject_once', 'allow_once']);
+  assert.equal(activityModule.classifyChoices(['Red', 'Blue']), null);
+  assert.equal(activityModule.classifyChoices(['Yes', 'Ok']), null);
+});
+
+test('reversed permission choices retain meaning and answer the original choice', async t => {
+  const r = await runner(t, {
+    frames: [resumed(), question([{ ...q, choices: ['Deny', 'Allow'] }])],
+    onCommand: [{ type: 'answer_question', frames: [question([])] }],
+    onHook(h, { input }) { if (h.subtype === 'permission_resolved') input.end(); },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.requests.find(r => r.url === '/api/activity/permission-requests').body.options, [
+    { optionId: 'choice-0', name: 'Deny', kind: 'reject_once' },
+    { optionId: 'choice-1', name: 'Allow', kind: 'allow_once' },
+  ]);
+  assert.equal(r.commands.find(c => c.type === 'answer_question').answer, 'Deny');
+});
+
+test('permission choices classify once and always after first-four truncation', async t => {
+  const api = await server(t, () => ({ ok: true, state: 'answered', optionId: 'choice-0' }));
+  const notes = []; t.mock.method(process.stderr, 'write', s => { notes.push(s); return true; });
+  const activity = createActivity({ env: { OPENRIG_URL: api.url, OPENRIG_ACTIVITY_HOOK_TOKEN: 't' } });
+  await activity.ask({ question: { ...q, choices: ['Allow', 'Deny', 'Allow for this session', 'Deny always', 'Red'] } });
+  assert.deepEqual(api.requests[0].body.options.map(o => o.kind), ['allow_once', 'reject_once', 'allow_always', 'reject_always']);
+  assert.equal(api.requests[0].body.options.length, 4);
+  assert.match(notes.join(''), /only the first four/);
+});
+
+for (const choices of [['Red', 'Blue'], ['Yes', 'Ok']]) {
+  test(`ambiguous permission choices ${choices.join('/')} remain in the pane`, async t => {
+    const api = await server(t, () => ({ ok: true, state: 'answered', optionId: 'choice-0' }));
+    const notes = []; t.mock.method(process.stderr, 'write', s => { notes.push(s); return true; });
+    const activity = createActivity({ env: { OPENRIG_URL: api.url, OPENRIG_ACTIVITY_HOOK_TOKEN: 't' } });
+    await activity.ask({ question: { ...q, title: 'Pick a choice', choices }, onAnswer: () => assert.fail('manual choice answered through OpenRig') });
+    assert.equal(api.requests.some(r => r.url === '/api/activity/permission-requests'), false);
+    assert.match(notes.join(''), /Pick a choice/);
+    assert.match(notes.join(''), /Type the exact choice/);
+    for (const choice of choices) assert.ok(notes.join('').includes(choice));
+  });
+}
 
 test('4 free text questions are answered from TTY and never posted as permission requests', async t => {
   const r = await runner(t, { tty: true, frames: [resumed(), [40, question([{ question_id: 'text', title: 'Your answer?' }])]], onCommand: [{ type: 'answer_question', frames: [question([])] }], start({ input }) { setTimeout(() => input.write('anything typed\r'), 150); setTimeout(() => input.end(), 250); } });

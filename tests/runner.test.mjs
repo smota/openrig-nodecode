@@ -235,7 +235,7 @@ test('turn.completed produces Stop/end_turn with the accepted turn id', async t 
 });
 
 test('organism questions post ordered options and map answered optionId to exact choice text on stdin', async t => {
-  const choices = ['Proceed once', 'No, keep it 🧪', 'Always proceed', 'Never proceed'];
+  const choices = ['Proceed once', 'No, keep it 🧪', 'Always proceed', 'Deny always'];
   const result = await harness(t, {
     env: freshEnv,
     frames: [handshake(), { after_stdin: '"type":"start_turn"', frames: [accepted, { payload: { type: 'organism.questions', questions: [{ question_id: 'question-1', title: 'May I proceed?', detail: 'Choose a policy', choices }] } }] }, { after_stdin: '"type":"answer_question"', frames: [completed()] }],

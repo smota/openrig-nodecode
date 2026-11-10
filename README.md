@@ -80,6 +80,7 @@ The cell exposes `rig_whoami`, `rig_queue_*`, `rig_send` and `rig_capture` as na
 
 - Shell UI is not shown.
 - Permissions are bridged from `organism.questions` only.
+- A question reaches OpenRig only when every choice can be read as allow or reject (once or always); others are answered in the pane by typing the exact choice. Only the first four choices are offered through OpenRig.
 - Model, provider, and effort apply to fresh sessions only. A resumed session stays pinned.
 - The bare runner shares the operator's organism unless `--profile` or `--seat-profile` selects a profile. The preset selects a separate seat organism with `--seat-profile auto`.
 - Node must be on the pane `PATH`.

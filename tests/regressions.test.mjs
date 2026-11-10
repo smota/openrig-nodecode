@@ -551,7 +551,7 @@ test('command channel cancels the active turn and posts Stop cancelled', async t
     },
   });
   assert.equal(r.code, 0, r.stderr);
-  assert.deepEqual(r.commands.map(c => c.type), ['start_turn', 'cancel_turn']);
+  assert.deepEqual(r.commands.filter(c => c.type !== 'set_session_subscriptions').map(c => c.type), ['start_turn', 'cancel_turn']);
   assert.equal(r.hooks.find(h => h.subtype === 'cancelled').reason, 'cancelled');
 });
 
@@ -567,7 +567,7 @@ test('command channel idle wake starts a turn and posts its completed text', asy
     },
   });
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(r.commands[0].request.prompt, 'hello?');
+  assert.equal(r.commands.find(c => c.type === 'start_turn').request.prompt, 'hello?');
   const answer = r.hooks.find(h => h.eventFamily === 'wake_answer');
   assert.deepEqual({ ...answer, occurredAt: undefined }, { eventFamily: 'wake_answer', id: 'wake-1', answer: 'fake reply', sessionName: 'pod-worker@rig', nodeId: 'node', generation: '7', occurredAt: undefined });
   assert.ok(Number.isFinite(Date.parse(answer.occurredAt)));
@@ -615,7 +615,7 @@ test('command channel wake deadline cancels without publishing a late answer', a
     },
   });
   assert.equal(r.code, 0, r.stderr);
-  assert.deepEqual(r.commands.map(c => c.type), ['start_turn', 'cancel_turn']);
+  assert.deepEqual(r.commands.filter(c => c.type !== 'set_session_subscriptions').map(c => c.type), ['start_turn', 'cancel_turn']);
   assert.equal(r.hooks.some(h => h.eventFamily === 'wake_answer'), false);
 });
 

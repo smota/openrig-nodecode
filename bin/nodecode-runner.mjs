@@ -84,7 +84,12 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   const workspace = path.resolve(opts.workspaceRoot || path.join(openrigHome, 'state', 'openrig-nodecode', seatName));
   const home = env.NODECODE_HOME || path.join(os.homedir(), '.nodecode');
   const bin = env.NODECODE_BIN || 'nodecode';
-  const seatProfile = opts.seatProfile ?? env.OPENRIG_NODECODE_SEAT_PROFILE ?? 'none';
+  // Explicit legacy profiles are existing-only and must not be replaced by env.
+  // Empty environment values are unset; explicit empty flags fail validation.
+  const envSeatProfile = env.NODECODE_SEAT_PROFILE || env.OPENRIG_NODECODE_SEAT_PROFILE || undefined;
+  const seatProfile = opts.seatProfile ?? (opts.profile !== null ? 'none'
+    : (envSeatProfile ?? opts.defaultSeatProfile ?? 'none'));
+  if (opts.seatProfile !== undefined) opts.profile = null;
   if (seatProfile !== 'none') {
     const profile = seatProfile === 'auto' ? `openrig-${sessionName.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'session'}` : seatProfile;
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(profile)) { note('invalid seat profile name'); return 2; }
@@ -93,6 +98,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     catch (cause) { note(`seat profile: ${cause.message}`); return 2; }
     note(`seat profile: ${profile}`);
   }
+  if (opts.profile !== null && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(opts.profile)) { note('invalid profile name'); return 2; }
   const profileHome = resolveSeatHome(home, opts.profile);
   const resumeRef = env.OPENRIG_RESUME_REF || null;
   const childEnv = { ...env };

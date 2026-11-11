@@ -12,6 +12,8 @@ npm install
 
 The runner bin is `openrig-nodecode-runner` (`bin/nodecode-runner.mjs`). Nodecode itself is the `nodecode` binary on `PATH` (`NODECODE_BIN` overrides it).
 
+Upgrade note: existing generated presets still carry explicit `--seat-profile auto`. From the desired persistent checkout, regenerate with `node scripts/install-preset.mjs --force`, preserving any custom installer arguments. An intentionally explicit `--seat-profile auto` continues to override `NODECODE_SEAT_PROFILE`.
+
 ## Preset
 
 `presets/nodecode.yaml` is a Format-1 community harness. Install it with:
@@ -20,20 +22,23 @@ The runner bin is `openrig-nodecode-runner` (`bin/nodecode-runner.mjs`). Nodecod
 node scripts/install-preset.mjs [--force] [--agent-yaml F] [--startup-file F]... [--profile NAME]
 ```
 
-`npm run install-preset --` accepts the same arguments. The script writes `${OPENRIG_HOME:-~/.openrig}/community-harnesses/nodecode.yaml`, sets `command` to the absolute path of `bin/nodecode-runner.mjs`, and appends every argument except `--force`. The preset defaults to `--seat-profile auto`; an explicit `--seat-profile` or legacy `--profile` overrides that default. It refuses to overwrite an existing file unless `--force`, then prints the destination path.
+`npm run install-preset --` accepts the same arguments. The script writes `${OPENRIG_HOME:-~/.openrig}/community-harnesses/nodecode.yaml`, sets `command` to the absolute path of `bin/nodecode-runner.mjs`, and appends every argument except `--force`. The preset defaults to `--default-seat-profile auto`, allowing environment selection. An explicit `--seat-profile`, legacy `--profile`, or custom `--default-seat-profile` is preserved without adding another profile flag. It refuses to overwrite an existing file unless `--force`, then prints the destination path.
 
 ## Env and flags
 
 ```text
-nodecode-runner.mjs [--agent-yaml F] [--startup-file F]... [--workspace-root D] [--profile NAME] [--seat-profile auto|none|NAME] [--store PATH] [--resume-policy head|last-completed] [--no-openrig-cell] [-- extra nodecode args]
+nodecode-runner.mjs [--agent-yaml F] [--startup-file F]... [--workspace-root D] [--profile NAME] [--seat-profile auto|none|NAME] [--default-seat-profile auto|none|NAME] [--store PATH] [--resume-policy head|last-completed] [--no-openrig-cell] [-- extra nodecode args]
 ```
 
 | Flag | Role |
 | --- | --- |
-| `--seat-profile auto\|none\|NAME` | Select or create a seat profile with an isolated session store and shared memory/skills. `auto` uses `openrig-` plus the session name lowercased and sanitized to letters, digits and hyphens. Flag overrides `OPENRIG_NODECODE_SEAT_PROFILE`; bare runner default is `none`. The preset selects `auto`. |
-| `--profile NAME` | Use an existing Nodecode profile (legacy flag). |
+| `--seat-profile auto\|none\|NAME` | Select or create a seat profile with an isolated session store and shared memory/skills. `auto` uses `openrig-` plus the session name lowercased and sanitized to letters, digits and hyphens. Overrides legacy `--profile` and both profile environment variables, including when set to `none`. The preset supplies a fallback of `auto`; the bare runner defaults to `none`. |
+| `--profile NAME` | Use an existing Nodecode profile (legacy flag), without listing or creating profiles. Overrides environment selection and the preset fallback. |
+| `--default-seat-profile auto\|none\|NAME` | Fallback selection when neither explicit profile flag nor profile environment variable is set. Named selections create only if absent, as with `--seat-profile`. |
 | `--resume-policy head\|last-completed` | Overrides `OPENRIG_NODECODE_RESUME_POLICY` (default `head`). On verified resume, `last-completed` moves a failed, cancelled or interrupted head to the last completed turn before sending queued prompts. Fresh launches are unaffected. The preset selects `last-completed`. |
 | `--no-openrig-cell` | Skip linking the bundled Openrig cell into the selected seat home. Existing entries are preserved. |
+
+Profile precedence: `--seat-profile` → `--profile` → `NODECODE_SEAT_PROFILE` → `OPENRIG_NODECODE_SEAT_PROFILE` → `--default-seat-profile` → `none`. Empty environment values are treated as unset, so selection continues to the next source. Whitespace is not trimmed and is rejected as an invalid selected name. Explicit empty profile flags are also invalid. Names must start with a letter or digit and contain only letters, digits, dots, underscores or hyphens; selected names are validated before profile creation or launch.
 
 Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
 
@@ -54,7 +59,8 @@ Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
 | `OPENRIG_NODE_ID` | Seat node id on activity posts. |
 | `OPENRIG_OCCUPANT_GENERATION` | Occupant generation on activity posts. |
 | `OPENRIG_RUNTIME` | Runtime name. Default `nodecode`. |
-| `OPENRIG_NODECODE_SEAT_PROFILE` | Fallback for `--seat-profile`; default `none`. |
+| `NODECODE_SEAT_PROFILE` | Seat profile selection (`auto`, `none`, or a name), below explicit flags and above the preset fallback. |
+| `OPENRIG_NODECODE_SEAT_PROFILE` | Compatibility alias, used when `NODECODE_SEAT_PROFILE` is unset or empty. |
 | `NODECODE_BIN` | Nodecode binary. Default `nodecode` on `PATH`. |
 | `NODECODE_HOME` | Nodecode home. Default `~/.nodecode`. Selected profiles resolve to `~/.nodecode/profiles/NAME` (Nodecode ignores `NODECODE_HOME` for profiles); skills link from `~/.nodecode/profiles/NAME` when that directory exists. |
 
@@ -82,7 +88,7 @@ The cell exposes `rig_whoami`, `rig_queue_*`, `rig_send` and `rig_capture` as na
 - Permissions are bridged from `organism.questions` only.
 - A question reaches OpenRig only when every choice can be read as allow or reject (once or always); others are answered in the pane by typing the exact choice. Only the first four choices are offered through OpenRig.
 - Model, provider, and effort apply to fresh sessions only. A resumed session stays pinned.
-- The bare runner shares the operator's organism unless `--profile` or `--seat-profile` selects a profile. The preset selects a separate seat organism with `--seat-profile auto`.
+- The bare runner shares the operator's organism unless a profile flag or environment variable selects a profile. The preset selects a separate seat organism with `--default-seat-profile auto`, unless overridden.
 - Node must be on the pane `PATH`.
 - At launch, stale `openrig-*` skill links are pruned when their targets or marker workspace directories disappear. Other entries are preserved.
 

@@ -13,7 +13,7 @@ const argv = process.argv.slice(2);
 const force = argv.includes('--force');
 const extra = argv.filter((arg) => arg !== '--force');
 if (!extra.includes('--resume-policy')) extra.push('--resume-policy', 'last-completed');
-if (!extra.includes('--seat-profile') && !extra.includes('--profile')) extra.unshift('--seat-profile', 'auto');
+if (!extra.includes('--seat-profile') && !extra.includes('--profile') && !extra.includes('--default-seat-profile')) extra.unshift('--default-seat-profile', 'auto');
 
 const openrigHome = process.env.OPENRIG_HOME
   ? path.resolve(process.env.OPENRIG_HOME)

@@ -1,6 +1,6 @@
 format: 1
 name: nodecode
-command: /ABS/openrig-nodecode/bin/nodecode-runner.mjs --seat-profile auto --resume-policy last-completed # install-preset renders abs path + optional --agent-yaml/--startup-file/--profile
+command: /ABS/openrig-nodecode/bin/nodecode-runner.mjs --default-seat-profile auto --resume-policy last-completed # install-preset renders abs path + optional --agent-yaml/--startup-file/--profile
 maintainer: "smota/openrig-nodecode"
 limits:
   - shell UI not shown

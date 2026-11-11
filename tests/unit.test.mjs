@@ -112,8 +112,15 @@ test('parseArgs defaults, repeated startup files, profile/store and passthrough'
   assert.deepEqual(parseArgs(['--agent-yaml', 'a', '--startup-file', 's1', '--startup-file', 's2', '--workspace-root', 'w', '--profile', 'p', '--store', 'db', '--', '--literal', 'space arg']), {
     startupFiles: ['s1', 's2'], agentYaml: 'a', workspaceRoot: 'w', profile: 'p', store: 'db', nodecodeArgs: ['--literal', 'space arg'],
   });
-  for (const flag of ['--agent-yaml', '--startup-file', '--workspace-root', '--profile', '--store']) assert.throws(() => parseArgs([flag]), /needs a value/);
+  for (const flag of ['--agent-yaml', '--startup-file', '--workspace-root', '--profile', '--seat-profile', '--default-seat-profile', '--store']) assert.throws(() => parseArgs([flag]), /needs a value/);
   for (const arg of ['--unknown', 'positional']) assert.throws(() => parseArgs([arg]), /unknown argument/);
+});
+
+test('parseArgs accepts explicit seat selection and a separate fallback', () => {
+  const opts = parseArgs(['--seat-profile', 'none', '--default-seat-profile', 'auto', '--profile', 'legacy']);
+  assert.equal(opts.seatProfile, 'none');
+  assert.equal(opts.defaultSeatProfile, 'auto');
+  assert.equal(opts.profile, 'legacy');
 });
 
 test('composeFirstPrompt preserves order, skips blank/unreadable files, uses nodecode label', t => {

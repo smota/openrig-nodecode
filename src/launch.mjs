@@ -13,6 +13,7 @@ export function parseArgs(argv) {
     else if (arg === '--workspace-root') opts.workspaceRoot = value();
     else if (arg === '--profile') opts.profile = value();
     else if (arg === '--seat-profile') opts.seatProfile = value();
+    else if (arg === '--default-seat-profile') opts.defaultSeatProfile = value();
     else if (arg === '--no-openrig-cell') opts.noOpenrigCell = true;
     else if (arg === '--resume-policy') opts.resumePolicy = value();
     else if (arg === '--store') opts.store = value();

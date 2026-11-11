@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -117,4 +117,18 @@ test('install-preset renders the absolute runner path and extra args', () => {
   });
   assert.notEqual(again.status, 0);
   assert.match(again.stderr, /overwrite|--force/);
+});
+
+
+test('installer preserves explicit profile and fallback arguments without duplication', t => {
+  for (const args of [[], ['--seat-profile', 'named'], ['--seat-profile', 'none'], ['--profile', 'legacy'], ['--default-seat-profile', 'custom'], ['--seat-profile', 'named', '--default-seat-profile', 'custom']]) {
+    const home = mkdtempSync(path.join(tmpdir(), 'nodecode-preset-'));
+    t.after(() => rmSync(home, { recursive: true, force: true }));
+    const run = spawnSync(process.execPath, [installer, ...args], { env: { ...process.env, OPENRIG_HOME: home }, encoding: 'utf8' });
+    assert.equal(run.status, 0, run.stderr);
+    const command = parsePreset(readFileSync(path.join(home, 'community-harnesses/nodecode.yaml'), 'utf8')).command;
+    const expected = args.length ? args : ['--default-seat-profile', 'auto'];
+    assert.equal(command, [path.join(root, 'bin/nodecode-runner.mjs'), ...expected, '--resume-policy', 'last-completed'].join(' '));
+  }
+  assert.match(parsePreset(readFileSync(presetPath, 'utf8')).command, / --default-seat-profile auto /);
 });

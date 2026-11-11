@@ -462,8 +462,33 @@ test('stale OpenRig skill links are pruned while live and foreign entries surviv
 test('seat profiles select argv, create only absent profiles and resolve profile gateway home', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'seat-profiles-')); t.after(() => fs.rmSync(root, {recursive:true,force:true}));
   t.mock.method(os, 'homedir', () => root);
-  for (const [selection, names, expected] of [['auto', [], 'openrig-main-lead'], ['auto', ['openrig-main-lead'], 'openrig-main-lead'], ['named', [], 'named'], ['none', [], null], [null, [], 'env-profile']]) {
-    const r = await runner(t, { argv: selection ? ['--seat-profile', selection] : [], env: { OPENRIG_SESSION_NAME: 'Main Lead', OPENRIG_NODECODE_SEAT_PROFILE: 'env-profile', ...(expected ? {OPENRIG_RESUME_REF: 'ref'} : {}) }, setup({dir, home, env, api}) {
+  const cases = [
+    [[], {}, [], null],
+    [['--default-seat-profile', 'auto'], {}, [], 'openrig-main-lead'],
+    [['--seat-profile', 'auto'], {}, ['openrig-main-lead'], 'openrig-main-lead'],
+    [['--default-seat-profile', 'fallback'], {}, [], 'fallback'],
+    [['--default-seat-profile', 'none'], {}, [], null],
+    [['--default-seat-profile', 'fallback'], { NODECODE_SEAT_PROFILE: 'auto' }, [], 'openrig-main-lead'],
+    [['--default-seat-profile', 'fallback'], { OPENRIG_NODECODE_SEAT_PROFILE: 'old' }, [], 'old'],
+    [['--seat-profile', 'none'], { NODECODE_SEAT_PROFILE: '../ignored' }, [], null],
+    [[], { NODECODE_SEAT_PROFILE: 'chosen', OPENRIG_NODECODE_SEAT_PROFILE: 'old' }, [], 'chosen'],
+    [[], { OPENRIG_NODECODE_SEAT_PROFILE: 'old' }, [], 'old'],
+    [[], { NODECODE_SEAT_PROFILE: '', OPENRIG_NODECODE_SEAT_PROFILE: 'old' }, [], 'old'],
+    [[], { NODECODE_SEAT_PROFILE: '', OPENRIG_NODECODE_SEAT_PROFILE: '' }, [], null],
+    [['--default-seat-profile', 'auto'], { NODECODE_SEAT_PROFILE: '', OPENRIG_NODECODE_SEAT_PROFILE: '' }, [], 'openrig-main-lead'],
+    [['--default-seat-profile', 'auto'], { NODECODE_SEAT_PROFILE: 'none' }, [], null],
+    [['--seat-profile', 'named'], {}, [], 'named'],
+    [['--seat-profile', 'named'], {}, ['named'], 'named'],
+    ...['auto', 'named', 'none'].map(selection => [
+      ['--profile', 'legacy', '--seat-profile', selection, '--default-seat-profile', 'fallback'],
+      { NODECODE_SEAT_PROFILE: 'chosen', OPENRIG_NODECODE_SEAT_PROFILE: 'old' }, [],
+      selection === 'auto' ? 'openrig-main-lead' : selection === 'none' ? null : selection,
+    ]),
+    [['--seat-profile', 'none', '--profile', 'legacy'], { NODECODE_SEAT_PROFILE: 'chosen' }, [], null],
+    [['--profile', 'legacy', '--default-seat-profile', 'auto'], { NODECODE_SEAT_PROFILE: 'chosen', OPENRIG_NODECODE_SEAT_PROFILE: 'old' }, [], 'legacy', true],
+  ];
+  for (const [argv, environment, names, expected, legacy = false] of cases) {
+    const r = await runner(t, { argv, env: { OPENRIG_SESSION_NAME: 'Main Lead', ...environment, ...(expected ? {OPENRIG_RESUME_REF: 'ref'} : {}) }, setup({dir, home, env, api}) {
       env.TEST_PROFILE_CALLS=path.join(dir,'profile-calls'); env.TEST_PROFILE_NAMES=path.join(dir,'names'); env.TEST_PROFILE_ROOT=path.join(root,'.nodecode/profiles');
       fs.writeFileSync(env.TEST_PROFILE_NAMES,JSON.stringify(names));
       if(expected) {
@@ -476,9 +501,10 @@ test('seat profiles select argv, create only absent profiles and resolve profile
     const args=JSON.parse(fs.readFileSync(path.join(r.dir,'argv')));
     assert.deepEqual(args.slice(0,expected ? 3 : 1),expected ? ['-p',expected,'rpc'] : ['rpc']);
     const calls=fs.existsSync(r.env.TEST_PROFILE_CALLS) ? fs.readFileSync(r.env.TEST_PROFILE_CALLS,'utf8').trim().split('\n').map(JSON.parse) : [];
-    assert.deepEqual(calls,expected ? [['profile','list'],...(!names.includes(expected) ? [['profile','create',expected]] : [])] : []);
+    assert.deepEqual(calls,expected && !legacy ? [['profile','list'],...(!names.includes(expected) ? [['profile','create',expected]] : [])] : []);
     if(expected) {
-      assert.equal(r.requests[0].headers.authorization,'Bearer seat-token'); assert.match(r.stderr,new RegExp(expected));
+      assert.equal(r.requests[0].headers.authorization,'Bearer seat-token');
+      if (!legacy) assert.match(r.stderr, new RegExp(expected));
       assert.equal(fs.readlinkSync(path.join(r.env.TEST_PROFILE_ROOT, expected, 'cells/sam-openrig')), openrigCell);
       assert.equal(fs.existsSync(path.join(r.home, 'cells/sam-openrig')), false);
     }
@@ -511,12 +537,103 @@ for (const [ending, policy, navigate] of [['failed', 'last-completed', true], ['
 }
 
 
+test('environment-selected profile bootstraps and resumes through its own gateway', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'profile-gateway-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.mock.method(os, 'homedir', () => root);
+  const r = await runner(t, {
+    env: { NODECODE_SEAT_PROFILE: 'chosen', OPENRIG_RESUME_REF: 'ref' },
+    gateway: `fs.writeFileSync(process.env.TEST_GATEWAY_LOG, JSON.stringify(process.argv.slice(2))); fs.writeFileSync(process.env.TEST_GATEWAY_OWNER, JSON.stringify({pid:Number(process.env.TEST_GATEWAY_PID),port:Number(process.env.TEST_GATEWAY_PORT)}));`,
+    setup({ dir, env, api, gatewayLog, home }) {
+      env.TEST_PROFILE_CALLS = path.join(dir, 'profile-calls');
+      env.TEST_PROFILE_NAMES = path.join(dir, 'names');
+      env.TEST_PROFILE_ROOT = path.join(root, '.nodecode/profiles');
+      fs.writeFileSync(env.TEST_PROFILE_NAMES, '["chosen"]');
+      const profile = path.join(env.TEST_PROFILE_ROOT, 'chosen');
+      fs.mkdirSync(path.join(profile, 'store'), { recursive: true });
+      fs.mkdirSync(path.join(profile, 'cells/linked-skills'), { recursive: true });
+      fs.writeFileSync(path.join(profile, 'operator-token'), 'selected-token');
+      env.TEST_GATEWAY_LOG = gatewayLog;
+      env.TEST_GATEWAY_OWNER = path.join(profile, 'store/main.owner');
+      env.TEST_GATEWAY_PID = String(process.pid);
+      env.TEST_GATEWAY_PORT = String(api.port);
+      fs.writeFileSync(path.join(home, 'store/main.owner'), JSON.stringify({ pid: process.pid, port: 1 }));
+    },
+    onHook: closeOnReady,
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(r.gatewayLog)), ['-p', 'chosen', 'gateway', 'on']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(r.dir, 'argv'))), ['-p', 'chosen', 'rpc', 'ref']);
+  assert.equal(r.requests[0].headers.authorization, 'Bearer selected-token');
+});
+
+test('invalid selected profile names fail before any profile command or launch', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'invalid-profile-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.mock.method(os, 'homedir', () => root);
+  const setup = ({ dir, env }) => {
+    env.TEST_PROFILE_CALLS = path.join(dir, 'profile-calls');
+    env.TEST_PROFILE_NAMES = path.join(dir, 'names');
+    env.TEST_PROFILE_ROOT = path.join(root, '.nodecode/profiles');
+    fs.writeFileSync(env.TEST_PROFILE_NAMES, '[]');
+  };
+  for (const selection of [
+    ['--seat-profile', '../bad'], ['--seat-profile', ''], ['--profile', '../bad'],
+    ['--default-seat-profile', 'bad/name'], ['--default-seat-profile', ''], ['--profile', ''],
+  ]) {
+    const r = await runner(t, { argv: selection, setup, onHook: closeOnReady });
+    assert.equal(r.code, 2, r.stderr);
+    assert.match(r.stderr, /invalid.*profile name/);
+    assert.equal(fs.existsSync(path.join(r.dir, 'argv')), false);
+    assert.equal(fs.existsSync(r.gatewayLog), false);
+    assert.equal(fs.existsSync(r.env.TEST_PROFILE_CALLS), false);
+  }
+  for (const key of ['NODECODE_SEAT_PROFILE', 'OPENRIG_NODECODE_SEAT_PROFILE']) {
+    for (const value of ['../bad', ' ']) {
+      const r = await runner(t, { env: { [key]: value }, setup, onHook: closeOnReady });
+      assert.equal(r.code, 2, r.stderr);
+      assert.match(r.stderr, /invalid.*profile name/);
+      assert.equal(fs.existsSync(path.join(r.dir, 'argv')), false);
+      assert.equal(fs.existsSync(r.env.TEST_PROFILE_CALLS), false);
+      assert.equal(fs.existsSync(r.gatewayLog), false);
+    }
+  }
+});
+
+test('installed default preset honors NODECODE_SEAT_PROFILE=chosen', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'installed-profile-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.mock.method(os, 'homedir', () => root);
+  const r = await runner(t, {
+    env: { NODECODE_SEAT_PROFILE: 'chosen' },
+    setup({ dir, env, argv }) {
+      const installed = spawnSync(process.execPath, ['scripts/install-preset.mjs'], {
+        env: { ...process.env, OPENRIG_HOME: env.OPENRIG_HOME }, encoding: 'utf8',
+      });
+      assert.equal(installed.status, 0, installed.stderr);
+      const preset = fs.readFileSync(path.join(env.OPENRIG_HOME, 'community-harnesses/nodecode.yaml'), 'utf8');
+      const command = /^command: (.*)$/m.exec(preset)[1];
+      // Installer emits plain argv here: this isolated checkout path has no spaces.
+      argv.push(...command.split(' ').slice(1));
+      env.TEST_PROFILE_CALLS = path.join(dir, 'profile-calls');
+      env.TEST_PROFILE_NAMES = path.join(dir, 'names');
+      env.TEST_PROFILE_ROOT = path.join(root, '.nodecode/profiles');
+      fs.writeFileSync(env.TEST_PROFILE_NAMES, '[]');
+    },
+    onHook: closeOnReady,
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(r.dir, 'argv'))), ['-p', 'chosen', 'rpc']);
+  assert.deepEqual(fs.readFileSync(r.env.TEST_PROFILE_CALLS, 'utf8').trim().split('\n').map(JSON.parse),
+    [['profile', 'list'], ['profile', 'create', 'chosen']]);
+});
+
 test('installed preset defaults to automatic seat profiles', t => {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'seat-preset-')); t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const installed=spawnSync(process.execPath,['scripts/install-preset.mjs'],{env:{...process.env,OPENRIG_HOME:dir},encoding:'utf8'});
   assert.equal(installed.status,0,installed.stderr);
   const preset=fs.readFileSync(path.join(dir,'community-harnesses/nodecode.yaml'),'utf8');
-  assert.match(preset,/^command: .* --seat-profile auto --resume-policy last-completed$/m);
+  assert.match(preset,/^command: .* --default-seat-profile auto --resume-policy last-completed$/m);
   assert.doesNotMatch(preset,/default home shares/);
 });
 

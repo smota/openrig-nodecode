@@ -14,6 +14,18 @@ import { parseModelSpec } from '../src/model-spec.mjs';
 import { probeSession, readSessionCheckpoints } from '../src/session-probe.mjs';
 import { createActivity } from '../src/activity.mjs';
 import { createFramer, createTurnTracker } from '../src/protocol.mjs';
+import { createRunnerChannel } from '../src/runner-channel.mjs';
+
+function nativeEnvironment(env) {
+  const childEnv = { ...env };
+  delete childEnv.OPENRIG_LAUNCH_WRAPPER;
+  // A new actual-run credential is private to this runner, including profile helpers.
+  if (env.OPENRIG_RUN_ID) {
+    delete childEnv.OPENRIG_ACTIVITY_HOOK_TOKEN;
+    delete childEnv.OPENRIG_RUN_ID;
+  }
+  return childEnv;
+}
 
 /** Nodecode profiles live under the operator home, even with NODECODE_HOME set. */
 export function resolveSeatHome(home, profile) {
@@ -94,15 +106,14 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     const profile = seatProfile === 'auto' ? `openrig-${sessionName.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'session'}` : seatProfile;
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(profile)) { note('invalid seat profile name'); return 2; }
     opts.profile = profile;
-    try { await ensureSeatProfile(bin, profile, env); }
+    try { await ensureSeatProfile(bin, profile, nativeEnvironment(env)); }
     catch (cause) { note(`seat profile: ${cause.message}`); return 2; }
     note(`seat profile: ${profile}`);
   }
   if (opts.profile !== null && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(opts.profile)) { note('invalid profile name'); return 2; }
   const profileHome = resolveSeatHome(home, opts.profile);
   const resumeRef = env.OPENRIG_RESUME_REF || null;
-  const childEnv = { ...env };
-  delete childEnv.OPENRIG_LAUNCH_WRAPPER;
+  const childEnv = nativeEnvironment(env);
   const activity = createActivity({ env: { ...env, OPENRIG_RUNTIME: env.OPENRIG_RUNTIME || 'nodecode' } });
   let ending = false;
   const post = (event, subtype, extra = {}) => ending ? Promise.resolve() : Promise.resolve(activity.post(event, subtype, extra)).catch(cause => note(`activity: ${cause.message}`));
@@ -165,6 +176,8 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   } catch (cause) { note(cause.message); return 2; }
   const args = nodecodeArgv({ bin, profile: opts.profile, store: opts.store, resumeRef, extra: opts.nodecodeArgs, wrapper });
   const turns = createTurnTracker();
+  let managedTurn = null;
+  const channel = createRunnerChannel({ env, enqueue(entry) { turns.enqueue(entry); drain(); } });
   const completedTurns = new Set();
   const commandNonce = randomUUID().slice(0, 8);
   const questions = new Map();
@@ -192,14 +205,23 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     if (inputEnded && ready && !resumeCheckpoint && !navigationCommand && !turns.busy && !turns.queue.length && ![...questions.values()].some(entry => !entry.answered) && child?.stdin?.writable) child.stdin.end();
   };
   const start = prompt => {
+    const managed = typeof prompt === 'object' ? prompt : null;
+    if (managed && channel?.halted) return;
     const commandId = nextCommand();
     if (!turns.submit(commandId)) { turns.enqueue(prompt); return; }
+    managedTurn = managed;
+    if (managed) prompt = managed.frame.kind === 'wake' ? managed.frame.payload.question : managed.frame.payload.text;
     const model = !resumeRef && firstTurn ? parseModelSpec(env.OPENRIG_MODEL) : {};
-    write({ type: 'start_turn', command_id: commandId, request: { prompt, ...model } });
+    const written = write({ type: 'start_turn', command_id: commandId, request: { prompt, ...model } });
+    if (!written && managed) {
+      managed.terminal = true;
+      void channel.result(managed, 'unknown', { submissionUnknown: true });
+    }
     activity.stopBeats();
   };
   const drain = () => {
     if (!ready || ending || resumeCheckpoint || navigationCommand || turns.busy) return;
+    if (typeof turns.queue[0] === 'object' && channel?.halted) return;
     const prompt = turns.dequeue();
     if (prompt !== undefined) start(prompt);
     else { idle(); maybeCloseInput(); }
@@ -259,6 +281,10 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     if (ending) return;
     if (kill) cancel();
     ending = true;
+    if (managedTurn && !managedTurn.terminal) {
+      managedTurn.terminal = true;
+      void channel.result(managedTurn, 'unknown', { submissionUnknown: !managedTurn.nativeTurnId });
+    }
     restoreInput();
     activity.stopBeats();
     questions.clear();
@@ -269,6 +295,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     }
     try { await activity.withdrawAll('exited'); } catch (cause) { note(`permission withdrawal: ${cause.message}`); }
     await activity.post('Stop', 'nodecode_exited');
+    await channel?.close();
     for (const stream of [output, input]) {
       if (stream.closed) stream.off('error', streamError);
       else stream.once('close', () => stream.off('error', streamError));
@@ -319,6 +346,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
         work();
       }
       if (firstPrompt) { turns.queue.unshift(firstPrompt); firstPrompt = ''; }
+      channel?.start();
       drain();
       return;
     }
@@ -334,17 +362,37 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
         return;
       }
       const startResult = (!result.command || result.command === 'start_turn') && (!commandId || commandId === turns.commandId);
+      // Managed native evidence must identify the exact command, never a recent/unlabelled reply.
+      if (managedTurn && startResult && commandId !== turns.commandId) {
+        managedTurn.contaminated = true;
+        if (!managedTurn.terminal) {
+          managedTurn.terminal = true;
+          void channel.result(managedTurn, 'unknown', { submissionUnknown: true });
+        }
+        return;
+      }
       const turnId = result.response?.turn_id ?? result.turn_id;
       const duplicate = startResult && result.status === 'accepted' && (result.message === 'turn already admitted' || (turnId && completedTurns.has(turnId)));
       if (duplicate || result.status === 'rejected') {
         note(`command rejected: ${JSON.stringify(result)}`);
         if (startResult && turns.reject(commandId)) {
+          if (managedTurn) {
+            managedTurn.terminal = true;
+            void channel.result(managedTurn, 'failed', { rejected: true });
+            managedTurn = null;
+          }
           cancelRequested = false;
           if (!turns.busy && !turns.queue.length) await post('Stop', 'error');
           drain();
         }
       } else if (result.status === 'accepted' || result.status === 'queued') {
         if (startResult && turns.accept(commandId, turnId)) {
+          if (managedTurn) {
+            if (typeof turnId !== 'string' || !turnId) {
+              managedTurn.terminal = true;
+              void channel.result(managedTurn, 'unknown', { submissionUnknown: true });
+            } else void channel.submitted(managedTurn, turnId);
+          }
           firstTurn = false;
           await post('UserPromptSubmit', 'accepted', { turnId: turns.turnId });
           work();
@@ -355,6 +403,10 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     }
     if (payload.type === 'sync_protocol_error') { note(`protocol error: ${payload.message ?? JSON.stringify(payload)}`); return; }
     if (payload.type === 'item_delta') {
+      if (managedTurn?.frame.kind === 'wake') {
+        if (payload.turn_id !== managedTurn.nativeTurnId) managedTurn.contaminated = true;
+        else if (payload.delta?.type === 'text' && typeof payload.delta.text === 'string') managedTurn.answer += payload.delta.text;
+      }
       turns.observe(payload.turn_id);
       const delta = payload.delta ?? {};
       if (delta.type === 'text' && typeof delta.text === 'string') output.write(delta.text);
@@ -375,7 +427,15 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     if (payload.type === 'session_stream_event') {
       const event = payload.frame?.event;
       const subtype = { 'turn.completed': 'end_turn', 'turn.failed': 'error', 'turn.cancelled': 'cancelled' }[event?.type];
+      if (managedTurn && (!managedTurn.nativeTurnId || (event?.turn_id ?? payload.frame?.turn_id) !== managedTurn.nativeTurnId)) return;
       if (!subtype || (turns.turnId && (event.turn_id ?? payload.frame.turn_id) && turns.turnId !== (event.turn_id ?? payload.frame.turn_id))) return;
+      if (managedTurn && !managedTurn.terminal) {
+        const completion = managedTurn.contaminated || subtype === 'end_turn' && managedTurn.frame.kind === 'wake' && !managedTurn.answer
+          ? 'unknown' : subtype === 'end_turn' ? 'completed' : subtype === 'cancelled' ? 'interrupted' : 'failed';
+        managedTurn.terminal = true;
+        void channel.result(managedTurn, completion, { ownershipUnknown: managedTurn.frame.kind === 'wake' && managedTurn.contaminated });
+      }
+      managedTurn = null;
       await post('Stop', subtype, { turnId: turns.turnId });
       if (ending) return;
       activity.stopBeats();

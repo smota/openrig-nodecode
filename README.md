@@ -64,6 +64,29 @@ Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
 | `NODECODE_BIN` | Nodecode binary. Default `nodecode` on `PATH`. |
 | `NODECODE_HOME` | Nodecode home. Default `~/.nodecode`. Selected profiles resolve to `~/.nodecode/profiles/NAME` (Nodecode ignores `NODECODE_HOME` for profiles); skills link from `~/.nodecode/profiles/NAME` when that directory exists. |
 
+## Optional run-bound input and wake
+
+When Core supplies both `OPENRIG_RUN_ID` and its scoped
+`OPENRIG_ACTIVITY_HOOK_TOKEN`, the runner connects to
+`/api/activity/runner-channel` at the supplied Core URL. Core controls native
+route selection and intersects the live declaration with its enabled
+implementations. Older Core versions keep the existing pane input path.
+
+Managed inputs reuse the existing native FIFO. Each wake waits for the current
+turn, then collects assistant text only from its own gateway command and native
+turn ID. Other managed prompts wait until that turn terminates. Failed,
+interrupted or uncertain wakes return no answer. Person `/abort` and Ctrl-C
+remain available. Reconnect retains request custody for the entire runner
+process and never resubmits an acknowledged native write. A replacement process
+cannot reconstruct that map and does not replay uncertain prior effects.
+
+The run credential stays in the runner and is removed from native/profile
+subprocess environments. No command file or global Core event subscription is
+used. Managed cancellation is currently advertised as `false`; native turn IDs
+on delivery receipts do not enable a managed cancellation operation. This
+implementation has fake-gateway fixture coverage, not native-program
+qualification, and does not change Core or preset defaults.
+
 ## Openrig cell
 
 At launch, the runner links `<seatHome>/cells/sam-openrig` to this checkout's `cells/openrig`, using the selected profile home or the default Nodecode home. An existing matching link is left in place; any other entry is preserved with a note. Use `--no-openrig-cell` to skip linking.

@@ -29,7 +29,7 @@ async function server(t, reply) {
     const r = { method: req.method, url: req.url, headers: req.headers, body: body ? JSON.parse(body) : null };
     requests.push(r);
     const value = await reply(r, res);
-    if (!res.writableEnded) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(value ?? { ok: true })); }
+    if (!res.writableEnded && !res.headersSent) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(value ?? { ok: true })); }
   });
   await new Promise(resolve => s.listen(0, '127.0.0.1', resolve));
   t.after(() => { s.closeAllConnections(); s.close(); });
@@ -37,13 +37,14 @@ async function server(t, reply) {
 }
 
 // Real child and HTTP boundaries, with temporary scripts and stream-backed TTYs.
-async function runner(t, { frames = [resumed()], onCommand = [], setup = () => {}, onHook, onAsk, onPoll, tty = false, env: overrides = {}, argv = [], start, noOwner = false, gateway, checkpoints } = {}) {
+async function runner(t, { frames = [resumed()], onCommand = [], setup = () => {}, onHook, onAsk, onPoll, onChannel, tty = false, env: overrides = {}, argv = [], start, noOwner = false, gateway, checkpoints } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nodecode-regression-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const input = new PassThrough(); input.isTTY = tty; input.setRawMode = value => { input.raw = value; };
   const output = new PassThrough(), error = new PassThrough(); let stdout = '', stderr = '';
   output.on('data', part => { stdout += part; }); error.on('data', part => { stderr += part; });
   const api = await server(t, async (r, res) => {
+    if (r.url === '/api/activity/runner-channel' && onChannel) return onChannel(r, res, { input });
     if (r.url.endsWith('/checkpoints')) return checkpoints;
     if (r.url.startsWith('/api/gateway/')) return { session_id: 'ref' };
     if (r.url === '/api/activity/hooks') { await onHook?.(r.body, { input, output, error }); return { ok: true }; }
@@ -57,7 +58,7 @@ async function runner(t, { frames = [resumed()], onCommand = [], setup = () => {
   fs.writeFileSync(path.join(home, 'operator-token'), 'token');
   const log = path.join(dir, 'stdin'), gatewayLog = path.join(dir, 'gateway');
   const bin = path.join(dir, 'fake.mjs');
-  fs.writeFileSync(bin, `#!${process.execPath}\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nif (process.argv[2] === 'profile') { fs.appendFileSync(process.env.TEST_PROFILE_CALLS, JSON.stringify(process.argv.slice(2))+'\\n'); const names=JSON.parse(fs.readFileSync(process.env.TEST_PROFILE_NAMES)); if(process.argv[3]==='list') console.log(names.map(name=>'  '+name+'  '+process.env.TEST_PROFILE_ROOT+'/'+name).join('\\n')); else if(process.argv[3]==='create') { names.push(process.argv[4]); fs.writeFileSync(process.env.TEST_PROFILE_NAMES,JSON.stringify(names)); fs.mkdirSync(process.env.TEST_PROFILE_ROOT+'/'+process.argv[4]+'/cells/linked-skills',{recursive:true}); } } else if (process.argv.includes('gateway')) { ${gateway || `fs.writeFileSync(${JSON.stringify(gatewayLog)}, JSON.stringify({env:process.env,argv:process.argv.slice(2),tty:process.stdout.isTTY, pipe:fs.fstatSync(1).isFIFO(),ownGroup:(()=>{try{process.kill(-process.pid,0);return true}catch{return false}})()})); fs.writeFileSync(${JSON.stringify(path.join(home, 'store/main.owner'))}, JSON.stringify({pid:${process.pid},port:${api.port}}));`} } else {\nfs.writeFileSync(${JSON.stringify(path.join(dir, 'argv'))}, JSON.stringify(process.argv.slice(2))); fs.writeFileSync(${JSON.stringify(path.join(dir, 'pid'))}, String(process.pid));\nif(process.env.TEST_CLOSE_STDIN) { setTimeout(()=>{process.stdin.destroy(); try { fs.closeSync(0); } catch {}}, 100); setTimeout(()=>{process.exitCode=19;}, 1500); }\nconst send = f => process.stdout.write(JSON.stringify(f)+'\\n');\nfor (const [delay,frame] of ${JSON.stringify(frames.map(f => Array.isArray(f) ? f : [0, f]))}) setTimeout(()=>send(frame), delay);\nlet navigationPending = false;\nconst actions = ${JSON.stringify(onCommand)};\nreadline.createInterface({input:process.stdin}).on('line', line => { fs.appendFileSync(${JSON.stringify(log)}, line+'\\n'); const frame=JSON.parse(line); if(frame.type==='start_turn' && navigationPending) process.stderr.write('EARLY_START\\n'); for(const a of actions) if(a.type===frame.type && (!a.prompt || a.prompt===frame.request?.prompt)) { if(a.delay && frame.type==='navigate_checkpoint') navigationPending=true; const respond=()=>{ for(const f of a.frames) send(f); if(frame.type==='navigate_checkpoint') navigationPending=false; }; if(a.delay) setTimeout(respond,a.delay); else respond(); } });\n}`);
+  fs.writeFileSync(bin, `#!${process.execPath}\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nif (process.argv[2] === 'profile') { fs.appendFileSync(${JSON.stringify(path.join(dir, 'profile-private-env'))}, JSON.stringify({token:Object.hasOwn(process.env,'OPENRIG_ACTIVITY_HOOK_TOKEN'),run:Object.hasOwn(process.env,'OPENRIG_RUN_ID')})+'\\n'); fs.appendFileSync(process.env.TEST_PROFILE_CALLS, JSON.stringify(process.argv.slice(2))+'\\n'); const names=JSON.parse(fs.readFileSync(process.env.TEST_PROFILE_NAMES)); if(process.argv[3]==='list') console.log(names.map(name=>'  '+name+'  '+process.env.TEST_PROFILE_ROOT+'/'+name).join('\\n')); else if(process.argv[3]==='create') { names.push(process.argv[4]); fs.writeFileSync(process.env.TEST_PROFILE_NAMES,JSON.stringify(names)); fs.mkdirSync(process.env.TEST_PROFILE_ROOT+'/'+process.argv[4]+'/cells/linked-skills',{recursive:true}); } } else if (process.argv.includes('gateway')) { ${gateway || `fs.writeFileSync(${JSON.stringify(gatewayLog)}, JSON.stringify({env:process.env,argv:process.argv.slice(2),tty:process.stdout.isTTY, pipe:fs.fstatSync(1).isFIFO(),ownGroup:(()=>{try{process.kill(-process.pid,0);return true}catch{return false}})()})); fs.writeFileSync(${JSON.stringify(path.join(home, 'store/main.owner'))}, JSON.stringify({pid:${process.pid},port:${api.port}}));`} } else {\nfs.writeFileSync(${JSON.stringify(path.join(dir, 'private-env'))}, JSON.stringify({ token: Object.hasOwn(process.env,'OPENRIG_ACTIVITY_HOOK_TOKEN'), run: Object.hasOwn(process.env,'OPENRIG_RUN_ID') })); fs.writeFileSync(${JSON.stringify(path.join(dir, 'argv'))}, JSON.stringify(process.argv.slice(2))); fs.writeFileSync(${JSON.stringify(path.join(dir, 'pid'))}, String(process.pid));\nif(process.env.TEST_CLOSE_STDIN) { setTimeout(()=>{process.stdin.destroy(); try { fs.closeSync(0); } catch {}}, 100); setTimeout(()=>{process.exitCode=19;}, 1500); }\nconst send = f => process.stdout.write(JSON.stringify(f)+'\\n');\nfor (const [delay,frame] of ${JSON.stringify(frames.map(f => Array.isArray(f) ? f : [0, f]))}) setTimeout(()=>send(frame), delay);\nlet navigationPending = false;\nconst actions = ${JSON.stringify(onCommand)};\nreadline.createInterface({input:process.stdin}).on('line', line => { fs.appendFileSync(${JSON.stringify(log)}, line+'\\n'); const frame=JSON.parse(line); if(frame.type==='start_turn' && navigationPending) process.stderr.write('EARLY_START\\n'); for(const a of actions) if(a.type===frame.type && (!a.prompt || a.prompt===frame.request?.prompt)) { if(a.delay && frame.type==='navigate_checkpoint') navigationPending=true; const respond=()=>{ for(const f of a.frames) { if(a.correlate && f.payload?.type==='gateway_turn_command_result') f.payload.result.command_id=frame.command_id; send(f); } if(frame.type==='navigate_checkpoint') navigationPending=false; }; if(a.delay) setTimeout(respond,a.delay); else respond(); } });\n}`);
   fs.chmodSync(bin, 0o755);
   const env = { PATH: process.env.PATH, NODECODE_BIN: bin, NODECODE_HOME: home, OPENRIG_HOME: path.join(dir, 'rig'), OPENRIG_URL: api.url, OPENRIG_ACTIVITY_HOOK_TOKEN: 'hook-token', OPENRIG_SESSION_NAME: 'pod-worker@rig', OPENRIG_NODE_ID: 'node', OPENRIG_LAUNCH_RESULT: path.join(dir, 'record'), ...overrides };
   const context = { dir, home, env, input, output, error, api, gatewayLog, log, argv };
@@ -116,7 +117,7 @@ test('1 profile resume reads the profile owner and token, not the default gatewa
 test('2 wrapper forbids gateway bootstrap; unwrapped bootstrap has clean env and detached stdio', async t => {
   const blocked = await runner(t, { noOwner: true, env: { OPENRIG_RESUME_REF: 'ref', OPENRIG_LAUNCH_WRAPPER: '["/usr/bin/env"]' } });
   assert.equal(blocked.code, 2); assert.match(blocked.stderr, /wrapper/i); assert.equal(fs.existsSync(blocked.gatewayLog), false);
-  const r = await runner(t, { noOwner: true, env: { OPENRIG_RESUME_REF: 'ref', OPENRIG_OTHER_SECRET: 'remove' }, onHook: closeOnReady });
+  const r = await runner(t, { noOwner: true, env: { OPENRIG_RESUME_REF: 'ref', OPENRIG_RUN_ID: 'private-run', OPENRIG_OTHER_SECRET: 'remove' }, onHook: closeOnReady });
   assert.equal(r.code, 0, r.stderr); const started = JSON.parse(fs.readFileSync(r.gatewayLog));
   assert.deepEqual(Object.keys(started.env).filter(k => k.startsWith('OPENRIG_')), []); assert.equal(started.pipe, false); assert.equal(started.ownGroup, true);
 });
@@ -703,4 +704,216 @@ test('--no-openrig-cell skips linking and preserves an existing cell', async t =
     else assert.throws(() => fs.lstatSync(link), { code: 'ENOENT' });
     assert.doesNotMatch(r.stderr, /sam-openrig/);
   }
+});
+
+test('run channel accepts once, reports native IDs and returns only the dedicated wake text', async t => {
+  const frame = { version: 1, runId: 'run-1', requestId: 'wake-1', sequence: 1, kind: 'wake', payload: { question: 'managed question' } };
+  const posts = [];
+  const r = await runner(t, {
+    env: { OPENRIG_RUN_ID: 'run-1' },
+    onChannel(req, res, { input }) {
+      assert.equal(req.headers.authorization, 'Bearer hook-token');
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(`id: 1\nevent: request\ndata: ${JSON.stringify(frame)}\n\nid: 1\nevent: request\ndata: ${JSON.stringify(frame)}\n\n`);
+        return new Promise(resolve => res.on('close', resolve));
+      }
+      posts.push(req.body);
+      if (req.body.type === 'hello') return { version: 1, runId: 'run-1', capabilities: { input: true, wake: true, cancel: false }, receipts: [], unresolved: [] };
+      if (req.body.type === 'result') input.end();
+      return { receipt: { ...frame, stage: req.body.type === 'ack' ? 'accepted' : req.body.type === 'submitted' ? 'submitted' : 'completed' } };
+    },
+    onCommand: [{ type: 'start_turn', prompt: 'managed question', correlate: true, frames: [result(), delta({ type: 'text', text: 'exact answer' }), ended()] }],
+    start({ input }) { setTimeout(() => input.end(), 800).unref(); },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['managed question']);
+  assert.equal(posts.filter(p => p.type === 'ack').length, 1);
+  assert.equal(posts.find(p => p.type === 'submitted').nativeTurnId, 'turn');
+  assert.deepEqual(posts.find(p => p.type === 'result').result, { kind: 'wake', nativeTurnId: 'turn', completion: 'completed', answer: 'exact answer' });
+  assert.deepEqual(posts[0].capabilities, { input: true, wake: true, cancel: false });
+  assert.equal(posts[0].retained, false);
+});
+
+test('new run credential and run ID never reach the native child or profile helper', async t => {
+  const r = await runner(t, {
+    env: { OPENRIG_RUN_ID: 'private-run', OPENRIG_ACTIVITY_HOOK_TOKEN: 'private-token' },
+    onHook: closeOnReady,
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(r.dir, 'private-env'))), { token: false, run: false });
+});
+
+async function channelScenario(t, { operations, onCommand, frames, start, loseAck = false, loseResult = false, reconnect = false, mutate, expectedResults = operations.length, expectedCode = 0 }) {
+  const posts = [], hellos = [], receipts = new Map();
+  let streams = 0, droppedAck = false, droppedResult = false;
+  const r = await runner(t, {
+    env: { OPENRIG_RUN_ID: 'run-1' }, frames, onCommand, start,
+    onChannel(req, res, { input }) {
+      if (req.method === 'GET') {
+        streams++;
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        for (const frame of operations) {
+          const data = JSON.stringify(frame);
+          // Exercise UTF-8/chunk/framing boundaries and duplicate delivery.
+          res.write(`id: ${frame.sequence}\r\nevent: request\r\ndata: ${data}`);
+          res.write('\r\n\r\n');
+        }
+        if (reconnect && streams === 1) res.end();
+        else return new Promise(resolve => res.on('close', resolve));
+        return;
+      }
+      const body = req.body; posts.push(body);
+      if (body.type === 'hello') {
+        hellos.push(body);
+        return { version: 1, runId: 'run-1', capabilities: { input: true, wake: true, cancel: false },
+          receipts: [...receipts.values()], unresolved: [...receipts.values()].filter(r => !['completed', 'rejected'].includes(r.stage)) };
+      }
+      const source = operations.find(r => r.requestId === body.requestId);
+      const receipt = { ...source, stage: body.type === 'ack' ? 'accepted' : body.type === 'submitted' ? 'submitted' : body.type === 'rejected' ? 'rejected' : 'completed' };
+      receipts.set(body.requestId, receipt);
+      if (body.type === 'ack' && loseAck && !droppedAck) { droppedAck = true; res.destroy(); return; }
+      if (body.type === 'result' && loseResult && !droppedResult) { droppedResult = true; res.destroy(); return; }
+      if ([...receipts.values()].filter(r => ['completed', 'rejected'].includes(r.stage)).length === expectedResults) input.end();
+      return mutate ? mutate(body, receipt) : { receipt };
+    },
+  });
+  assert.equal(r.code, expectedCode, r.stderr);
+  return { ...r, posts, hellos };
+}
+const managed = (sequence, kind = 'wake', text = `question-${sequence}`) => ({ version: 1, runId: 'run-1', requestId: `request-${sequence}`, sequence, kind, stage: 'offered', payload: kind === 'wake' ? { question: text } : { text } });
+const nativeResult = (id, status = 'accepted') => ({ payload: { type: 'gateway_turn_command_result', result: { command: 'start_turn', status, response: { turn_id: id } } } });
+const nativeEnd = (id, type = 'turn.completed') => ({ payload: { type: 'session_stream_event', frame: { event: { type, turn_id: id } } } });
+const nativeText = (id, text) => ({ payload: { type: 'item_delta', turn_id: id, delta: { type: 'text', text } } });
+const action = (prompt, id, extra = [], type = 'turn.completed', delay = 0) => ({ type: 'start_turn', prompt, correlate: true, delay, frames: [nativeResult(id), ...extra, nativeEnd(id, type)] });
+
+test('busy managed inputs and two dedicated wakes reuse the native FIFO without mixing answers', async t => {
+  const r = await channelScenario(t, {
+    operations: [managed(1, 'input', 'ordinary'), managed(2), managed(3), managed(4, 'input', 'after')],
+    start({ input }) { input.write('person\n'); },
+    onCommand: [action('person', 'person', [nativeText('person', 'previous')], 'turn.completed', 80), action('ordinary', 'ordinary'),
+      action('question-2', 'wake-2', [nativeText('wake-2', 'café 🧪')], 'turn.completed', 20),
+      action('question-3', 'wake-3', [nativeText('wake-3', 'second')]), action('after', 'after')],
+  });
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['person', 'ordinary', 'question-2', 'question-3', 'after']);
+  assert.deepEqual(r.posts.filter(p => p.type === 'result' && p.result.kind === 'wake').map(p => p.result.answer), ['café 🧪', 'second']);
+});
+
+test('lost ack/result responses and stream reconnect retain custody without a second native write', async t => {
+  const r = await channelScenario(t, { operations: [managed(1)], loseAck: true, loseResult: true, reconnect: true,
+    onCommand: [action('question-1', 'native-one', [nativeText('native-one', 'one')], 'turn.completed', 200)] });
+  assert.equal(r.commands.filter(c => c.type === 'start_turn').length, 1);
+  assert.ok(r.hellos.length >= 2);
+  assert.equal(r.hellos[0].retained, false);
+  assert.ok(r.hellos.slice(1).every(h => h.retained === true));
+  const results = r.posts.filter(p => p.type === 'result');
+  assert.equal(results.length, 2);
+  assert.deepEqual(results[0], results[1]);
+  assert.deepEqual(r.posts.filter(p => p.type === 'ack')[0], r.posts.filter(p => p.type === 'ack')[1]);
+});
+
+test('failed, cancelled and foreign-output wakes never return an answer', async t => {
+  for (const [name, extra, ending, completion] of [
+    ['failed', [], 'turn.failed', 'failed'], ['cancelled', [], 'turn.cancelled', 'interrupted'],
+    ['foreign', [nativeText('other-turn', 'unrelated')], 'turn.completed', 'unknown'],
+  ]) await t.test(name, async t => {
+    const r = await channelScenario(t, { operations: [managed(1)],
+      onCommand: [action('question-1', 'native-one', [...extra, nativeText('native-one', 'partial')], ending)] });
+    const result = r.posts.find(p => p.type === 'result').result;
+    assert.equal(result.completion, completion); assert.equal(result.answer, null);
+    if (name === 'foreign') assert.equal(result.ownershipUnknown, true);
+  });
+});
+
+test('native rejection is retained without a typed or native fallback', async t => {
+  const r = await channelScenario(t, { operations: [managed(1)], onCommand: [{ type: 'start_turn', correlate: true, frames: [nativeResult('never', 'rejected')] }] });
+  assert.equal(r.commands.filter(c => c.type === 'start_turn').length, 1);
+  assert.equal(r.posts.find(p => p.type === 'rejected').result.completion, 'failed');
+});
+
+test('older Core without the optional channel preserves ordinary pane input', async t => {
+  const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1' }, start({ input }) { input.end('ordinary\n'); },
+    onChannel(req, res) { res.writeHead(404); res.end('{}'); },
+    onCommand: [action('ordinary', 'person')] });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['ordinary']);
+});
+
+test('unlabelled native admission reports submission uncertainty and cannot complete from recent output', async t => {
+  const r = await channelScenario(t, { operations: [managed(1)], expectedCode: 143,
+    onCommand: [{ type: 'start_turn', frames: [nativeResult('unbound'), nativeText('unbound', 'wrong'), nativeEnd('unbound')] }],
+    start({ input }) { setTimeout(() => input.end(), 200).unref(); setTimeout(() => process.emit('SIGTERM'), 300).unref(); },
+  });
+  assert.equal(r.commands.filter(c => c.type === 'start_turn').length, 1);
+  const reported = r.posts.find(p => p.type === 'result').result;
+  assert.equal(reported.submissionUnknown, true);
+  assert.equal(reported.completion, 'unknown'); assert.equal(reported.answer, null);
+});
+
+test('terminal wake without assistant text is unknown, then the next managed input advances', async t => {
+  const r = await channelScenario(t, { operations: [managed(1), managed(2, 'input', 'next')],
+    onCommand: [action('question-1', 'empty'), action('next', 'next')] });
+  const wake = r.posts.find(p => p.type === 'result' && p.result.kind === 'wake').result;
+  assert.equal(wake.completion, 'unknown'); assert.equal(wake.answer, null);
+  assert.equal(r.commands.filter(c => c.type === 'start_turn').length, 2);
+});
+
+test('new scoped credential is absent from both profile list/create subprocesses', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'nodecode-private-profile-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.mock.method(os, 'homedir', () => home);
+  const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1' }, argv: ['--seat-profile', 'auto'],
+    setup({ env, dir }) {
+      env.TEST_PROFILE_CALLS = path.join(dir, 'calls'); env.TEST_PROFILE_NAMES = path.join(dir, 'names');
+      env.TEST_PROFILE_ROOT = path.join(home, '.nodecode/profiles'); fs.writeFileSync(env.TEST_PROFILE_NAMES, '[]');
+    }, onHook: closeOnReady });
+  assert.equal(r.code, 0, r.stderr);
+  const checks = fs.readFileSync(path.join(r.dir, 'profile-private-env'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(checks, [{ token: false, run: false }, { token: false, run: false }]);
+});
+
+test('wrong run, conflicting replay, lost map and uncommitted ack refuse before another native effect', async t => {
+  for (const mode of ['wrong-run', 'sequence-conflict', 'payload-conflict', 'lost-map', 'ack-malformed', 'ack-refused', 'ack-already-completed']) await t.test(mode, async t => {
+    let posts = 0, streams = 0;
+    const offered = managed(1, 'input', 'only-once');
+    const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1' },
+      onChannel(req, res) {
+        if (req.body?.type === 'hello') return { version: 1, runId: 'run-1', capabilities: { input: true, wake: true, cancel: false },
+          receipts: mode === 'lost-map' ? [{ ...offered, stage: 'submitted', reconciliation: 'receiver_state_lost' }] : [], unresolved: [] };
+        if (req.method === 'GET') {
+          streams++;
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          let frames = mode === 'wrong-run' ? [{ ...offered, runId: 'wrong' }] : [offered];
+          if (mode === 'sequence-conflict') frames.push({ ...offered, requestId: 'other-request' });
+          if (mode === 'payload-conflict') frames.push({ ...offered, payload: { text: 'other-text' } });
+          for (const frame of frames) res.write(`id: 1\nevent: request\ndata: ${JSON.stringify(frame)}\n\n`);
+          return new Promise(resolve => res.on('close', resolve));
+        }
+        posts++;
+        if (mode === 'ack-refused') { res.writeHead(403); res.end('{}'); return; }
+        if (mode === 'ack-malformed') return { ok: true };
+        if (mode === 'ack-already-completed') return { receipt: { ...offered, stage: 'completed' } };
+        return { receipt: { ...offered, stage: 'accepted' } };
+      },
+      onCommand: [action('only-once', 'one')],
+      start({ input }) { setTimeout(() => input.end(), 180).unref(); },
+    });
+    assert.equal(r.code, 0, r.stderr);
+    assert.ok(r.commands.filter(c => c.type === 'start_turn').length <= (mode.endsWith('conflict') ? 1 : 0));
+    if (mode === 'lost-map') assert.equal(streams, 0);
+    if (mode === 'wrong-run') assert.equal(posts, 0);
+  });
+});
+
+test('person abort remains turn scoped during a managed wake and releases the held input', async t => {
+  const r = await channelScenario(t, { operations: [managed(1), managed(2, 'input', 'successor')],
+    onCommand: [
+      { type: 'start_turn', prompt: 'question-1', correlate: true, frames: [nativeResult('wake'), nativeText('wake', 'partial')] },
+      { type: 'cancel_turn', frames: [nativeEnd('wake', 'turn.cancelled')] }, action('successor', 'successor'),
+    ], start({ input }) { setTimeout(() => input.write('/abort\n'), 140).unref(); },
+  });
+  const cancel = r.commands.find(c => c.type === 'cancel_turn'); assert.equal(cancel.turn_id, 'wake');
+  assert.equal(r.posts.find(p => p.type === 'result' && p.result.kind === 'wake').result.completion, 'interrupted');
+  assert.equal(r.posts.find(p => p.type === 'result' && p.result.kind === 'wake').result.answer, null);
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['question-1', 'successor']);
 });

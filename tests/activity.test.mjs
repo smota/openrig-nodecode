@@ -53,3 +53,48 @@ test('missing endpoint is a no-op', async () => {
   assert.equal(a.enabled, false); await a.post('Stop', 'ready'); await a.ask({ question: { choices: [] } }); await a.withdrawAll('exited');
   a.startIdleBeats(); a.startWorkBeats('t'); a.stopBeats();
 });
+
+test('unbound submission stays visible through late ask-ID cleanup after local withdrawal', async t => {
+  let submitted, releaseSubmit, withdrawing, releaseWithdrawal;
+  const submitReached = new Promise(resolve => { submitted = resolve; });
+  const submitGate = new Promise(resolve => { releaseSubmit = resolve; });
+  const withdrawalReached = new Promise(resolve => { withdrawing = resolve; });
+  const withdrawalGate = new Promise(resolve => { releaseWithdrawal = resolve; });
+  const f = await fixture(t, async r => {
+    if (r.url.endsWith('/withdraw')) { withdrawing(); await withdrawalGate; return { ok: true, state: 'withdrawn' }; }
+    submitted(); await submitGate; return { ok: true, askId: 'late', state: 'pending' };
+  });
+  const task = f.activity.ask({ question: { question_id: 'q', title: 'Q', choices: ['yes'] }, onAnswer: () => assert.fail('withdrawn question answered') });
+  await submitReached; await task.withdraw('turn_ended');
+  assert.equal(f.activity.hasUnboundQuestions, true);
+  releaseSubmit(); await withdrawalReached;
+  assert.equal(f.activity.hasUnboundQuestions, true);
+  releaseWithdrawal(); await task;
+  assert.equal(f.activity.hasUnboundQuestions, false);
+  assert.equal(Object.hasOwn(f.requests[0].body, 'runId'), false); assert.equal(Object.hasOwn(f.requests[0].body, 'nativeTurnId'), false);
+});
+
+test('answer callback drain waits for an already started native answer write', async t => {
+  let writing, release;
+  const reached = new Promise(resolve => { writing = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const f = await fixture(t, () => ({ state: 'permitted', optionId: 'choice-0' }));
+  const task = f.activity.ask({ question: { question_id: 'q', title: 'Q', choices: ['yes'] }, async onAnswer() { writing(); await gate; return true; } });
+  await reached;
+  let drained = false; const draining = f.activity.drainAnswers().then(() => { drained = true; });
+  await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(drained, false);
+  release(); await draining; await task;
+  assert.equal(drained, true); assert.equal(f.activity.hasUnboundQuestions, false);
+});
+
+test('unknown unbound withdrawal stays unsafe for managed cancellation after the local question closes', async t => {
+  let polling; const reached = new Promise(resolve => { polling = resolve; });
+  const f = await fixture(t, async r => {
+    if (r.url.endsWith('/withdraw')) return { ok: false, code: 'withdrawal_unavailable' };
+    if (r.method === 'GET') { polling(); await new Promise(resolve => setTimeout(resolve, 40)); return { state: 'pending' }; }
+    return { ok: true, askId: 'unbound', state: 'pending' };
+  });
+  const task = f.activity.ask({ question: { question_id: 'q', title: 'Q', choices: ['yes'] }, onAnswer: () => assert.fail('closed question answered') });
+  await reached; await task.withdraw('turn_ended'); await task;
+  assert.equal(f.activity.hasUnboundQuestions, true);
+});

@@ -176,8 +176,8 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   } catch (cause) { note(cause.message); return 2; }
   const args = nodecodeArgv({ bin, profile: opts.profile, store: opts.store, resumeRef, extra: opts.nodecodeArgs, wrapper });
   const turns = createTurnTracker();
-  let managedTurn = null;
-  const channel = createRunnerChannel({ env, enqueue(entry) { turns.enqueue(entry); drain(); } });
+  let managedTurn = null, nativeTurn = null, cancellation = null;
+  const channel = createRunnerChannel({ env, enqueue(entry) { turns.enqueue(entry); drain(); }, prepareCancel: prepareCancellation, acceptCancel: acceptCancellation });
   const completedTurns = new Set();
   const commandNonce = randomUUID().slice(0, 8);
   const questions = new Map();
@@ -199,11 +199,72 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     if (turns.turnId) write({ type: 'cancel_turn', command_id: nextCommand(), turn_id: turns.turnId });
     else if (turns.busy) { if (turns.submitted) cancelRequested = true; note('cannot abort yet: active turn has no turn id'); }
   };
+  const unboundQuestions = () => [...questions.values()].some(entry => !entry.answered) || activity.hasUnboundQuestions;
+  function prepareCancellation(entry) {
+    const target = entry.frame.payload.target;
+    if (target.runId !== env.OPENRIG_RUN_ID || turns.turnId !== target.nativeTurnId || !turns.busy || nativeTurn?.closed)
+      return { outcome: 'not-this-turn' };
+    if (!nativeTurn || nativeTurn.id !== target.nativeTurnId || cancellation || channel.halted || managedTurn?.contaminated || unboundQuestions())
+      return { outcome: 'not-supported' };
+    const operation = { entry, target, epoch: nativeTurn, accepted: false, written: false, acknowledged: false, coreSubmitted: false };
+    cancellation = operation; // Prompt and answer fence precedes the Core acknowledgement.
+    return operation;
+  }
+  function releaseCancellation(operation) {
+    if (cancellation !== operation) return;
+    cancellation = null;
+    if (ending) return;
+    for (const entry of questions.values()) if (entry.held && !entry.answered) {
+      entry.held = false;
+      if (entry.handle) printQuestion(entry.question); else ask(entry);
+    }
+    drain();
+  }
+  function cancellationSubmitted(operation) {
+    if (operation.coreSubmitted) return;
+    operation.coreSubmitted = true;
+    void channel.cancelSubmitted(operation.entry, operation.acknowledged);
+  }
+  function finishCancellation(outcome, detail) {
+    const operation = cancellation; if (!operation) return;
+    if (operation.written && !['not-this-turn', 'not-supported'].includes(outcome)) cancellationSubmitted(operation);
+    void channel.cancelResult(operation.entry, outcome, operation.acknowledged, detail);
+    releaseCancellation(operation);
+  }
+  async function acceptCancellation(entry, accepted) {
+    const operation = entry.operation;
+    if (!accepted) { releaseCancellation(operation); return; }
+    if (operation?.outcome || ending) {
+      void channel.cancelResult(entry, operation?.outcome ?? 'not-supported', false, ending ? 'native_unavailable' : undefined);
+      releaseCancellation(operation); return;
+    }
+    if (cancellation !== operation) return;
+    operation.accepted = true;
+    try {
+      await activity.drainAnswers();
+      while (!ending && cancellation === operation) {
+        if (nativeTurn !== operation.epoch || operation.epoch.closed) { finishCancellation('not-this-turn'); return; }
+        if (unboundQuestions() || channel.halted) { finishCancellation('not-supported', 'permission_or_native_ownership_unknown'); return; }
+        const withdrawal = await channel.prepareCancellation(entry);
+        if (cancellation !== operation) return;
+        await activity.drainAnswers();
+        if (nativeTurn !== operation.epoch || operation.epoch.closed || withdrawal?.notThisTurn) { finishCancellation('not-this-turn'); return; }
+        if (unboundQuestions() || channel.halted) { finishCancellation('not-supported', 'permission_or_native_ownership_unknown'); return; }
+        if (withdrawal?.confirmed === true && withdrawal.pendingSubmissions === 0) {
+          if (!child?.stdin?.writable || child.stdin.destroyed) { finishCancellation('not-supported', 'native_unavailable'); return; }
+          operation.commandId = nextCommand(); operation.written = true;
+          write({ type: 'cancel_turn', command_id: operation.commandId, turn_id: operation.target.nativeTurnId });
+          return;
+        }
+        await new Promise(resolve => { const timer = setTimeout(resolve, 100); timer.unref(); });
+      }
+    } catch { if (cancellation === operation && !operation.written) finishCancellation('not-supported', 'preparation_unavailable'); }
+  }
   const idle = () => { activity.stopBeats(); activity.startIdleBeats({ nativeRef }); };
   const work = () => { if (!ending) activity.startWorkBeats(turns.turnId); };
   const maybeCloseInput = () => {
     const dispatchable = turns.queue.some(prompt => typeof prompt === 'string' || !channel?.halted);
-    if (inputEnded && ready && !resumeCheckpoint && !navigationCommand && !turns.busy && !dispatchable && ![...questions.values()].some(entry => !entry.answered) && child?.stdin?.writable) child.stdin.end();
+    if (inputEnded && ready && !resumeCheckpoint && !navigationCommand && !cancellation && !turns.busy && !dispatchable && ![...questions.values()].some(entry => !entry.answered) && child?.stdin?.writable) child.stdin.end();
   };
   const start = prompt => {
     const managed = typeof prompt === 'object' ? prompt : null;
@@ -221,7 +282,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     activity.stopBeats();
   };
   const drain = () => {
-    if (!ready || ending || resumeCheckpoint || navigationCommand || turns.busy) return;
+    if (!ready || ending || resumeCheckpoint || navigationCommand || cancellation || turns.busy) return;
     // Retain quarantined managed custody in this FIFO while explicit person input remains usable.
     const index = channel?.halted ? turns.queue.findIndex(prompt => typeof prompt === 'string') : 0;
     const prompt = index < 0 ? undefined : turns.queue.splice(index, 1)[0];
@@ -236,6 +297,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     const pending = questions.get(questionId);
     const choices = pending?.question.choices;
     if (!pending || pending.answered || pending.answering || (Array.isArray(choices) && choices.length && !choices.includes(choice))) return false;
+    if (cancellation) { pending.held = true; return false; }
     pending.answering = true;
     const written = await new Promise(resolve => {
       if (!write({ type: 'answer_question', command_id: nextCommand(), question_id: questionId, answer: choice }, resolve)) resolve(false);
@@ -252,6 +314,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   };
   const ask = entry => {
     const question = entry.question;
+    if (cancellation) { entry.held = true; printQuestion(question); return; }
     const onAnswer = choice => {
       if (questions.get(question.question_id) !== entry || ending) return false;
       return answer(question.question_id, choice, true);
@@ -281,8 +344,9 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   };
   const finish = async (code, { kill = false } = {}) => {
     if (ending) return;
-    if (kill) cancel();
+    if (kill && !cancellation?.written) cancel();
     ending = true;
+    if (cancellation?.accepted) finishCancellation(cancellation.written ? 'requested' : 'not-supported', 'native_outcome_unknown');
     if (managedTurn && !managedTurn.terminal) {
       managedTurn.terminal = true;
       void channel.result(managedTurn, 'unknown', { submissionUnknown: !managedTurn.nativeTurnId });
@@ -317,6 +381,9 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     if (ending || !frame || typeof frame !== 'object') return;
     const payload = frame.payload ?? frame;
     if (!payload || typeof payload !== 'object') return;
+    const frameSession = frame.session_id ?? payload.session_id;
+    if (channel && (nativeTurn || managedTurn || cancellation) && nativeRef && frameSession && frameSession !== nativeRef
+      && ['gateway_turn_command_result', 'item_delta', 'session_stream_event'].includes(payload.type)) return;
     if (payload.type === 'session_stream_resumed') {
       if (ready) return;
       nativeRef = frame.session_id || payload.session_id || payload.header?.session_id || resumeRef;
@@ -355,6 +422,15 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     if (payload.type === 'gateway_turn_command_result') {
       const result = payload.result ?? {};
       const commandId = result.command_id ?? payload.command_id;
+      if (cancellation?.written && commandId === cancellation.commandId && result.command === 'cancel_turn') {
+        const operation = cancellation;
+        const targetId = result.response?.turn_id ?? result.turn_id;
+        if (targetId === operation.target.nativeTurnId && (!result.session_id || result.session_id === nativeRef)) {
+          if (result.status === 'accepted') { operation.acknowledged = true; cancellationSubmitted(operation); }
+          else if (result.status === 'rejected' && !operation.coreSubmitted) finishCancellation(result.code === 'turn_mismatch' ? 'not-this-turn' : 'not-supported', result.code);
+        }
+        return;
+      }
       if (navigationCommand && (commandId === navigationCommand || (!commandId && result.command === 'navigate_checkpoint'))) {
         if (result.status !== 'accepted') { note(`resume checkpoint navigation failed: ${JSON.stringify(result)}`); await finish(2, { kill: true }); return; }
         note(`resume: head moved to turn ${resumeCheckpoint.turnId} (last completed; last turn was ${resumeCheckpoint.ending})`);
@@ -389,6 +465,10 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
         }
       } else if (result.status === 'accepted' || result.status === 'queued') {
         if (startResult && turns.accept(commandId, turnId)) {
+          if (result.status === 'accepted' && commandId && commandId === turns.commandId && typeof turnId === 'string' && turnId && !completedTurns.has(turnId)) {
+            nativeTurn = { id: turnId, acceptedTurnIds: [turnId], closed: false };
+            void channel?.turn(turnId, 'opened', nativeTurn.acceptedTurnIds);
+          }
           if (managedTurn) {
             if (typeof turnId !== 'string' || !turnId) {
               managedTurn.terminal = true;
@@ -429,8 +509,15 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
     if (payload.type === 'session_stream_event') {
       const event = payload.frame?.event;
       const subtype = { 'turn.completed': 'end_turn', 'turn.failed': 'error', 'turn.cancelled': 'cancelled' }[event?.type];
+      const terminalId = event?.turn_id ?? payload.frame?.turn_id;
+      if (nativeTurn && (!terminalId || terminalId !== nativeTurn.id)) return;
       if (managedTurn && (!managedTurn.nativeTurnId || (event?.turn_id ?? payload.frame?.turn_id) !== managedTurn.nativeTurnId)) return;
       if (!subtype || (turns.turnId && (event.turn_id ?? payload.frame.turn_id) && turns.turnId !== (event.turn_id ?? payload.frame.turn_id))) return;
+      if (nativeTurn) {
+        const epoch = nativeTurn; epoch.closed = true; completedTurns.add(epoch.id);
+        void channel?.turn(epoch.id, 'closed', epoch.acceptedTurnIds); nativeTurn = null;
+        if (cancellation?.epoch === epoch && cancellation.written) finishCancellation(subtype === 'cancelled' ? 'cancelled' : 'requested', subtype);
+      }
       if (managedTurn && !managedTurn.terminal) {
         const completion = managedTurn.contaminated || subtype === 'end_turn' && managedTurn.frame.kind === 'wake' && !managedTurn.answer
           ? 'unknown' : subtype === 'end_turn' ? 'completed' : subtype === 'cancelled' ? 'interrupted' : 'failed';

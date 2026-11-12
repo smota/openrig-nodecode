@@ -44,6 +44,7 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
   const endpoint = endpointFor(env);
   const identity = { sessionName: env.OPENRIG_SESSION_NAME, nodeId: env.OPENRIG_NODE_ID, generation: env.OPENRIG_OCCUPANT_GENERATION, runtime: env.OPENRIG_RUNTIME || 'nodecode' };
   const asks = new Set();
+  const submissions = new Set(), answers = new Set(), withdrawals = new Set();
   let sequence = 0;
   let chain = Promise.resolve();
   let beat;
@@ -64,6 +65,12 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
   const enqueue = (route, body) => {
     const result = chain.then(() => call('POST', route, body));
     chain = result.then(() => {}, () => {});
+    return result;
+  };
+  const withdrawRequest = async (state, reason) => {
+    withdrawals.add(state);
+    const result = await enqueue(`/api/activity/permission-requests/${encodeURIComponent(state.askId)}/withdraw`, { reason });
+    if (result?.ok === true && ['withdrawn', 'stale', 'answered', 'permitted', 'refused'].includes(result.state)) withdrawals.delete(state);
     return result;
   };
   const post = (hookEvent, subtype, extra = {}) => {
@@ -99,7 +106,7 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
     const withdraw = reason => {
       if (state.ended) return state.withdrawal || Promise.resolve();
       state.ended = true; state.reason = reason; controller.abort(); asks.delete(state);
-      if (state.askId && !state.answered) state.withdrawal = enqueue(`/api/activity/permission-requests/${encodeURIComponent(state.askId)}/withdraw`, { reason });
+      if (state.askId && !state.answered) state.withdrawal = withdrawRequest(state, reason);
       return state.withdrawal || Promise.resolve();
     };
     state.withdraw = withdraw;
@@ -111,15 +118,20 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
       const kinds = classifyChoices(choices);
       if (kinds === null) { manual(); return; }
       const options = choices.map((name, index) => ({ optionId: `choice-${index}`, name, kind: kinds[index] }));
-      const submitted = await enqueue('/api/activity/permission-requests', {
-        sessionName, nodeId, generation, nativeRef, turnId, requestId: question?.question_id,
-        toolCall: { title: question?.title, kind: 'question' }, options, occurredAt: occurredAt(),
-      });
-      state.askId = submitted?.ok ? submitted.askId : null;
-      if (state.ended) {
-        if (state.askId) await enqueue(`/api/activity/permission-requests/${encodeURIComponent(state.askId)}/withdraw`, { reason: state.reason });
-        return;
-      }
+      let submitted;
+      submissions.add(state);
+      try {
+        // Native question boards have no native turn ID. These remain unbound, never guessed scoped asks.
+        submitted = await enqueue('/api/activity/permission-requests', {
+          sessionName, nodeId, generation, nativeRef, turnId, requestId: question?.question_id,
+          toolCall: { title: question?.title, kind: 'question' }, options, occurredAt: occurredAt(),
+        });
+        state.askId = submitted?.ok ? submitted.askId : null;
+        if (state.ended) {
+          if (state.askId) await withdrawRequest(state, state.reason);
+          return;
+        }
+      } finally { submissions.delete(state); }
       let answer = submitted;
       let failureSince = null, backoff = 250;
       while (!state.ended) {
@@ -127,7 +139,10 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
           state.answered = true;
           const option = options.find(item => item.optionId === answer.optionId);
           if (option) {
-            const written = await onAnswer?.(option.name);
+            const writing = Promise.resolve().then(() => onAnswer?.(option.name));
+            answers.add(writing);
+            let written;
+            try { written = await writing; } finally { answers.delete(writing); }
             const ended = state.ended;
             state.ended = true; asks.delete(state);
             if (written && !ended) await post('active', 'permission_resolved', { turnId, ...(state.askId ? { askId: state.askId } : {}) });
@@ -153,5 +168,7 @@ export function createActivity({ env = process.env, fetchImpl = globalThis.fetch
     return task;
   };
   const withdrawAll = reason => Promise.all([...asks].map(state => state.withdraw(reason)));
-  return { enabled: Boolean(endpoint), identity: publishIdentity, post, startIdleBeats, startWorkBeats, stopBeats, ask, withdrawAll };
+  const drainAnswers = async () => { while (answers.size) await Promise.allSettled([...answers]); };
+  return { enabled: Boolean(endpoint), identity: publishIdentity, post, startIdleBeats, startWorkBeats, stopBeats, ask, withdrawAll, drainAnswers,
+    get hasUnboundQuestions() { return asks.size > 0 || submissions.size > 0 || withdrawals.size > 0; } };
 }

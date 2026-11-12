@@ -731,7 +731,7 @@ test('run channel accepts once, reports native IDs and returns only the dedicate
   assert.equal(posts.filter(p => p.type === 'ack').length, 1);
   assert.equal(posts.find(p => p.type === 'submitted').nativeTurnId, 'turn');
   assert.deepEqual(posts.find(p => p.type === 'result').result, { kind: 'wake', nativeTurnId: 'turn', completion: 'completed', answer: 'exact answer' });
-  assert.deepEqual(posts[0].capabilities, { input: true, wake: true, cancel: false });
+  assert.deepEqual(posts[0].capabilities, { input: true, wake: true, cancel: true });
   assert.equal(posts[0].retained, false);
 });
 
@@ -1010,4 +1010,183 @@ test('non-pending authority and protocol failures stay permanent rather than ret
     assert.equal(r.code, 0, r.stderr); assert.equal(posts, 1); assert.equal(gets, 0);
     assert.equal(r.commands.some(c => c.type === 'start_turn'), false);
   });
+});
+
+const nativeCancelResult = (id, status = 'accepted', code = 'ok') => ({ payload: { type: 'gateway_turn_command_result', result: { command: 'cancel_turn', status, code, response: { turn_id: id } } } });
+async function cancelScenario(t, { frames = [resumed(), [450, nativeEnd('E')]], onCommand, prepare, onPost, onAsk, onPoll, start, duplicate = false, env: overrides = {}, expectedCode = 0 } = {}) {
+  const posts = [], request = { version: 1, runId: 'run-1', requestId: 'cancel-E', sequence: 1, kind: 'cancel', stage: 'offered', payload: { target: { runId: 'run-1', nativeTurnId: 'E' } } };
+  let stream, offered = false, opened = false;
+  const offer = () => { if (stream && opened && !offered) { offered = true; const frame = `id: 1\nevent: request\ndata: ${JSON.stringify(request)}\n\n`; stream.write(frame); if (duplicate) stream.write(frame); } };
+  const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1', ...overrides }, frames, onAsk, onPoll,
+    onCommand: onCommand ?? [
+      { type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] },
+      { type: 'cancel_turn', correlate: true, frames: [nativeCancelResult('E'), nativeEnd('E', 'turn.cancelled')] },
+    ],
+    onChannel: async (req, res, context) => {
+      if (req.method === 'GET') { stream = res; res.writeHead(200, { 'content-type': 'text/event-stream' }); offer(); return new Promise(resolve => res.on('close', resolve)); }
+      const body = req.body; posts.push(body);
+      const custom = await onPost?.(body, res, context); if (custom !== undefined || res.writableEnded || res.destroyed) return custom;
+      if (body.type === 'hello') return { version: 1, runId: 'run-1', capabilities: { input: true, wake: true, cancel: true }, receipts: [], unresolved: [] };
+      if (body.type === 'turn') { if (body.state === 'opened' && body.nativeTurnId === 'E') { opened = true; offer(); } return { accepted: true }; }
+      if (body.type === 'cancel-prepare') return prepare ? prepare(body, context) : { receipt: { ...request, stage: 'accepted' }, withdrawal: { confirmed: true, pendingSubmissions: 0, withdrawn: 0 } };
+      if (body.type === 'result') context.input.end();
+      return { receipt: { ...request, stage: { ack: 'accepted', submitted: 'submitted', result: 'completed' }[body.type] } };
+    },
+    start(context) { context.input.write('E\n'); setTimeout(() => context.input.end(), 550).unref(); start?.(context); },
+  });
+  assert.equal(r.code, expectedCode, r.stderr); return { ...r, posts };
+}
+
+test('named cancellation reports the exact native epoch and confirms only its cancelled terminal', async t => {
+  const r = await cancelScenario(t);
+  assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 1);
+  assert.equal(r.commands.find(c => c.type === 'cancel_turn').turn_id, 'E');
+  assert.deepEqual(r.posts.filter(p => p.type === 'turn').map(p => [p.nativeTurnId, p.state, p.acceptedTurnIds]), [['E', 'opened', ['E']], ['E', 'closed', ['E']]]);
+  assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'cancelled');
+  assert.equal(r.posts.find(p => p.type === 'result').result.confirmed, true);
+  assert.ok(r.posts.findIndex(p => p.type === 'cancel-prepare') < r.posts.findIndex(p => p.type === 'submitted'));
+});
+
+test('cancel fences successors before a delayed ack and never targets naturally ended E or successor F', async t => {
+  let log;
+  const r = await cancelScenario(t, {
+    frames: [resumed(), [110, nativeEnd('E')]],
+    onCommand: [{ type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] }, action('F', 'F')],
+    onPost: async body => {
+      if (body.type === 'ack') {
+        await pause(180);
+        const commands = fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+        assert.deepEqual(commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['E']);
+      }
+    }, start(context) { log = context.log; context.input.write('F\n'); },
+  });
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['E', 'F']);
+  assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 0);
+  assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'not-this-turn');
+});
+
+test('cancel rechecks E after confirmed withdrawal and preserves a no-effect result when E ended during preparation', async t => {
+  const r = await cancelScenario(t, {
+    frames: [resumed(), [130, nativeEnd('E')]],
+    onCommand: [{ type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] }, action('F', 'F')],
+    async prepare(body) { await pause(180); return { receipt: { version: 1, runId: 'run-1', requestId: body.requestId, sequence: body.sequence, kind: 'cancel', stage: 'accepted', payload: { target: { runId: 'run-1', nativeTurnId: 'E' } }, withdrawal: { stage: 'confirmed' } }, withdrawal: { confirmed: true, pendingSubmissions: 0, withdrawn: 1 } }; },
+    start({ input }) { input.write('F\n'); },
+  });
+  assert.ok(r.posts.some(p => p.type === 'cancel-prepare'));
+  assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 0);
+  assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'not-this-turn');
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['E', 'F']);
+});
+
+test('cancellation RPC acceptance or normal completion cannot confirm cancellation', async t => {
+  const r = await cancelScenario(t, { onCommand: [
+    { type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] },
+    { type: 'cancel_turn', correlate: true, frames: [nativeCancelResult('E')] },
+  ] });
+  assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 1);
+  assert.equal(r.posts.find(p => p.type === 'submitted').result.outcome, 'requested');
+  assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'requested');
+  assert.equal(r.posts.find(p => p.type === 'result').result.confirmed, false);
+  assert.equal(r.posts.find(p => p.type === 'result').result.operationAccepted, true);
+});
+
+test('definite native turn mismatch remains not-this-turn without a fabricated submitted cancellation', async t => {
+  const r = await cancelScenario(t, { onCommand: [
+    { type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] },
+    { type: 'cancel_turn', correlate: true, frames: [nativeCancelResult('E', 'rejected', 'turn_mismatch')] },
+  ] });
+  assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 1);
+  assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'not-this-turn');
+  assert.equal(r.posts.some(p => p.type === 'submitted'), false);
+});
+
+test('known unbound native questions refuse managed cancellation without invented scoped metadata', async t => {
+  const r = await cancelScenario(t, {
+    frames: [resumed(), [350, nativeEnd('E')], [420, question([])]],
+    onCommand: [{ type: 'start_turn', prompt: 'E', correlate: true, frames: [question([{ ...q, session_id: 'ref' }]), nativeResult('E')] }],
+    onAsk: () => ({ ok: true, askId: 'unbound', state: 'pending' }), onPoll: async () => { await pause(300); return { state: 'pending' }; },
+  });
+  assert.equal(r.commands.some(c => c.type === 'cancel_turn'), false);
+  assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'not-supported');
+  const permission = r.requests.find(r => r.url === '/api/activity/permission-requests').body;
+  assert.equal(Object.hasOwn(permission, 'runId'), false); assert.equal(Object.hasOwn(permission, 'nativeTurnId'), false);
+  assert.equal(r.posts.some(p => p.type === 'cancel-prepare'), false);
+});
+
+test('late unbound question during cancellation is held and cannot forward an answer', async t => {
+  const r = await cancelScenario(t, {
+    frames: [resumed(), [110, question([{ ...q, session_id: 'ref' }])], [180, question([])], [450, nativeEnd('E')]],
+    async prepare(body, { input }) {
+      await pause(90); input.write('Yes\n'); await pause(110);
+      return { receipt: { version: 1, runId: 'run-1', requestId: body.requestId, sequence: body.sequence, kind: 'cancel', stage: 'accepted', payload: { target: { runId: 'run-1', nativeTurnId: 'E' } } }, withdrawal: { confirmed: true, pendingSubmissions: 0, withdrawn: 0 } };
+    },
+  });
+  assert.equal(r.commands.some(c => c.type === 'answer_question'), false);
+  assert.equal(r.requests.some(r => r.url === '/api/activity/permission-requests'), false);
+  assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 1);
+  assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'cancelled');
+});
+
+test('duplicate cancel offers and lost ack/result responses do not repeat the native cancel', async t => {
+  let ack = false, result = false;
+  const r = await cancelScenario(t, { duplicate: true,
+    onPost(body, res) {
+      if (body.type === 'ack' && !ack) { ack = true; res.destroy(); return null; }
+      if (body.type === 'result' && !result) { result = true; res.destroy(); return null; }
+    },
+  });
+  assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 1);
+  assert.equal(r.posts.filter(p => p.type === 'ack').length, 2);
+  const results = r.posts.filter(p => p.type === 'result'); assert.equal(results.length, 2); assert.deepEqual(results[0], results[1]);
+});
+
+test('native RPC client exit after a cancel write remains requested with unknown effect and no retry', async t => {
+  const r = await cancelScenario(t, { env: { TEST_CLOSE_STDIN: '1' }, expectedCode: 19, frames: [resumed()], onCommand: [
+    { type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] },
+  ] });
+  assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 1);
+  const result = r.posts.find(p => p.type === 'result').result;
+  assert.equal(result.outcome, 'requested'); assert.equal(result.confirmed, false); assert.equal(result.operationAccepted, false);
+  assert.equal(r.posts.some(p => p.type === 'turn' && p.state === 'closed'), false);
+});
+
+test('failed accepted acknowledgement cleans the local cancel fence without a native or receipt completion effect', async t => {
+  const r = await cancelScenario(t, {
+    onCommand: [{ type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] }, action('F', 'F')],
+    onPost: async (body, res) => { if (body.type === 'ack') { await pause(60); res.writeHead(403); res.end('{}'); return null; } },
+    start({ input }) { input.write('F\n'); },
+  });
+  assert.equal(r.commands.some(c => c.type === 'cancel_turn'), false);
+  assert.equal(r.posts.some(p => p.type === 'cancel-prepare' || p.type === 'submitted' || p.type === 'result'), false);
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['E', 'F']);
+});
+
+test('unconfirmed withdrawal remains pending with no native write until E actually terminates', async t => {
+  const r = await cancelScenario(t, {
+    onCommand: [{ type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] }, action('F', 'F')],
+    prepare(body) { return { receipt: { version: 1, runId: 'run-1', requestId: body.requestId, sequence: body.sequence, kind: 'cancel', stage: 'accepted', payload: { target: { runId: 'run-1', nativeTurnId: 'E' } }, withdrawal: { stage: 'pending' } }, withdrawal: { confirmed: false, pendingSubmissions: 1, withdrawn: 0 } }; },
+    start({ input }) { input.write('F\n'); },
+  });
+  assert.ok(r.posts.filter(p => p.type === 'cancel-prepare').length >= 2);
+  assert.equal(r.commands.some(c => c.type === 'cancel_turn'), false); assert.equal(r.posts.some(p => p.type === 'submitted'), false);
+  assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'not-this-turn');
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['E', 'F']);
+});
+
+test('foreign-session cancelled event cannot confirm a cancellation even with the same native turn ID', async t => {
+  const r = await cancelScenario(t, { onCommand: [
+    { type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] },
+    { type: 'cancel_turn', correlate: true, frames: [nativeCancelResult('E'), { session_id: 'foreign-session', ...nativeEnd('E', 'turn.cancelled') }] },
+  ] });
+  const result = r.posts.find(p => p.type === 'result').result;
+  assert.equal(result.outcome, 'requested'); assert.equal(result.confirmed, false);
+  assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 1);
+});
+
+test('queued native admission does not fabricate an opened current cancellation epoch', async t => {
+  const r = await cancelScenario(t, { frames: [resumed(), [160, nativeEnd('queued-native')]],
+    onCommand: [{ type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('queued-native', 'queued')] }],
+  });
+  assert.equal(r.posts.some(p => p.type === 'turn'), false);
+  assert.equal(r.commands.some(c => c.type === 'cancel_turn'), false);
 });

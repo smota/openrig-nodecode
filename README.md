@@ -64,7 +64,7 @@ Workspace default: `$OPENRIG_HOME/state/openrig-nodecode/<sessionName>`.
 | `NODECODE_BIN` | Nodecode binary. Default `nodecode` on `PATH`. |
 | `NODECODE_HOME` | Nodecode home. Default `~/.nodecode`. Selected profiles resolve to `~/.nodecode/profiles/NAME` (Nodecode ignores `NODECODE_HOME` for profiles); skills link from `~/.nodecode/profiles/NAME` when that directory exists. |
 
-## Optional run-bound input and wake
+## Run-bound input, wake and cancellation
 
 When Core supplies both `OPENRIG_RUN_ID` and its scoped
 `OPENRIG_ACTIVITY_HOOK_TOKEN`, the runner connects to
@@ -82,9 +82,13 @@ cannot reconstruct that map and does not replay uncertain prior effects.
 
 The run credential stays in the runner and is removed from native/profile
 subprocess environments. No command file or global Core event subscription is
-used. Managed cancellation is currently advertised as `false`; native turn IDs
-on delivery receipts do not enable a managed cancellation operation. This
-implementation has fake-gateway fixture coverage, not native-program
+used. When Core supports named cancellation, the runner reports owned native
+turns and accepts only the frozen `{runId, nativeTurnId}` target. It waits for
+confirmed Core permission preparation before one native cancel write. A matching
+native cancelled event confirms cancellation; command acceptance or client exit
+alone does not. Unbound native questions or uncertain withdrawal refuse managed
+cancellation, while person controls remain available. This implementation has
+fake-gateway fixture and actual Core HTTP coverage, not native-program
 qualification, and does not change Core or preset defaults.
 
 ## Openrig cell

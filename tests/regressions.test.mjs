@@ -917,3 +917,97 @@ test('person abort remains turn scoped during a managed wake and releases the he
   assert.equal(r.posts.find(p => p.type === 'result' && p.result.kind === 'wake').result.answer, null);
   assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['question-1', 'successor']);
 });
+
+test('reconnect hello leaves pending requests for the actual offered transition', async t => {
+  const operations = [managed(1, 'input', 'first'), managed(2, 'input', 'second')];
+  const stages = new Map(); let gets = 0; const errors = [], hellos = [];
+  const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1' },
+    onCommand: [action('first', 'first'), action('second', 'second')],
+    onChannel(req, res, { input }) {
+      if (req.body?.type === 'hello') {
+        hellos.push(req.body.retained);
+        const receipts = operations.filter(f => stages.has(f.requestId)).map(f => ({ ...f, stage: stages.get(f.requestId) }));
+        return { version: 1, runId: 'run-1', capabilities: { input: true, wake: true, cancel: false }, receipts, unresolved: receipts.filter(f => f.stage !== 'completed') };
+      }
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        if (++gets === 1) { stages.set('request-1', 'offered'); stages.set('request-2', 'pending'); res.end(); return; }
+        const frame = operations[1]; stages.set(frame.requestId, 'offered');
+        res.write(`id: 2\nevent: request\ndata: ${JSON.stringify(frame)}\n\n`);
+        return new Promise(resolve => res.on('close', resolve));
+      }
+      const body = req.body, stage = stages.get(body.requestId);
+      const expected = { ack: 'offered', submitted: 'accepted', result: 'submitted' }[body.type];
+      if (stage !== expected) { errors.push([body.type, stage]); res.writeHead(409); res.end(JSON.stringify({ code: 'runner_stage_conflict' })); input.end(); return; }
+      const next = { ack: 'accepted', submitted: 'submitted', result: 'completed' }[body.type]; stages.set(body.requestId, next);
+      if ([...stages.values()].every(value => value === 'completed')) input.end();
+      return { receipt: { ...operations.find(f => f.requestId === body.requestId), stage: next } };
+    }, start({ input }) { setTimeout(() => input.end(), 700).unref(); },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(errors, []); assert.deepEqual(hellos, [false, true]); assert.equal(gets, 2);
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['first', 'second']);
+});
+
+test('startup retries only explicit pending-grant standing with the same run credential', async t => {
+  let hellos = 0; const posts = [], frame = managed(1, 'input', 'after-activation');
+  const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1' }, onCommand: [action('after-activation', 'activated')],
+    onChannel(req, res, { input }) {
+      assert.equal(req.headers.authorization, 'Bearer hook-token');
+      if (req.body?.type === 'hello') {
+        posts.push(req.body);
+        if (++hellos === 1) { res.writeHead(409); res.end(JSON.stringify({ code: 'runner_grant_pending' })); return; }
+        return { version: 1, runId: 'run-1', capabilities: { input: true, wake: true, cancel: false }, receipts: [], unresolved: [] };
+      }
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(`id: 1\nevent: request\ndata: ${JSON.stringify(frame)}\n\n`);
+        return new Promise(resolve => res.on('close', resolve));
+      }
+      if (req.body.type === 'result') input.end();
+      return { receipt: { ...frame, stage: { ack: 'accepted', submitted: 'submitted', result: 'completed' }[req.body.type] } };
+    }, start({ input }) { setTimeout(() => input.end(), 700).unref(); },
+  });
+  assert.equal(r.code, 0, r.stderr); assert.equal(hellos, 2); assert.deepEqual(posts[0], posts[1]);
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['after-activation']);
+});
+
+test('managed quarantine retains its successor while later manual prompts and abort remain usable', async t => {
+  for (const tty of [false, true]) await t.test(tty ? 'Ctrl-C' : '/abort', async t => {
+  const operations = [managed(1), managed(2, 'input', 'held-managed')], posts = [];
+  const r = await runner(t, { tty, env: { OPENRIG_RUN_ID: 'run-1' },
+    onCommand: [action('question-1', 'wake', [nativeText('foreign', 'other'), nativeText('wake', 'unsafe')], 'turn.completed', 80),
+      { type: 'start_turn', prompt: 'manual-one', correlate: true, frames: [nativeResult('person-one')] },
+      { type: 'cancel_turn', frames: [nativeEnd('person-one', 'turn.cancelled')] }, action('manual-two', 'person-two')],
+    onChannel(req, res, { input }) {
+      if (req.body?.type === 'hello') return { version: 1, runId: 'run-1', capabilities: { input: true, wake: true, cancel: false }, receipts: [], unresolved: [] };
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        for (const f of operations) res.write(`id: ${f.sequence}\nevent: request\ndata: ${JSON.stringify(f)}\n\n`);
+        return new Promise(resolve => res.on('close', resolve));
+      }
+      posts.push(req.body);
+      if (req.body.type === 'result') { input.write('manual-one\nmanual-two\n'); setTimeout(() => { input.write(tty ? '\u0003' : '/abort\n'); input.end(); }, 80).unref(); }
+      return { receipt: { ...operations.find(f => f.requestId === req.body.requestId), stage: { ack: 'accepted', submitted: 'submitted', result: 'completed' }[req.body.type] } };
+    }, start({ input }) { setTimeout(() => input.end(), 600).unref(); },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['question-1', 'manual-one', 'manual-two']);
+  assert.equal(r.commands.find(c => c.type === 'cancel_turn').turn_id, 'person-one');
+  assert.equal(posts.find(p => p.type === 'result').result.ownershipUnknown, true);
+  assert.equal(posts.filter(p => p.requestId === 'request-2').length, 1);
+  assert.equal(posts.find(p => p.requestId === 'request-2').type, 'ack');
+  });
+});
+
+test('non-pending authority and protocol failures stay permanent rather than retrying every 409', async t => {
+  for (const [status, code] of [[401, 'runner_grant_revoked'], [409, 'runner_grant_stale'], [409, 'runner_run_mismatch'],
+    [409, 'runner_stage_conflict'], [409, 'unknown_conflict'], [400, 'runner_grant_pending']]) await t.test(code, async t => {
+    let posts = 0, gets = 0;
+    const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1' }, onChannel(req, res) {
+      if (req.method === 'GET') gets++; else posts++;
+      res.writeHead(status); res.end(JSON.stringify({ code }));
+    }, start({ input }) { setTimeout(() => input.end(), 180).unref(); } });
+    assert.equal(r.code, 0, r.stderr); assert.equal(posts, 1); assert.equal(gets, 0);
+    assert.equal(r.commands.some(c => c.type === 'start_turn'), false);
+  });
+});

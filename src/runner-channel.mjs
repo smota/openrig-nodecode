@@ -17,7 +17,8 @@ export function createRunnerChannel({ env, enqueue, fetchImpl = globalThis.fetch
     const response = await fetchImpl(url, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify(body), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(2000)]) });
     if (!response.ok) {
-      if (response.status < 500 && ![408, 429].includes(response.status)) halted = true;
+      const pendingGrant = response.status === 409 && (await response.json().catch(() => null))?.code === 'runner_grant_pending';
+      if (!pendingGrant && response.status < 500 && ![408, 429].includes(response.status)) halted = true;
       throw new Error('channel unavailable');
     }
     return response.json();
@@ -58,7 +59,7 @@ export function createRunnerChannel({ env, enqueue, fetchImpl = globalThis.fetch
       if (JSON.stringify(old.frame) !== JSON.stringify(frame)) halted = true;
       return;
     }
-    if (frame.sequence <= maximum || raw.stage && !['pending', 'offered'].includes(raw.stage)) { halted = true; return; }
+    if (frame.sequence <= maximum || raw.stage && raw.stage !== 'offered') { halted = true; return; }
     maximum = frame.sequence;
     const entry = { frame, reports: Promise.resolve(), nativeTurnId: null, answer: '', contaminated: false };
     entries.set(frame.requestId, entry);
@@ -102,7 +103,8 @@ export function createRunnerChannel({ env, enqueue, fetchImpl = globalThis.fetch
         if (hello.receipts.some(r => r.reconciliation || !entries.has(r.requestId) && ['accepted', 'submitted'].includes(r.stage))) { halted = true; break; }
         if (!hello.capabilities.input && !hello.capabilities.wake) break;
         // Reconcile retained offers independently of the stream cursor. Known requests never execute twice.
-        for (const frame of hello.unresolved) if (!frame.erasedAt && ['pending', 'offered'].includes(frame.stage)) await accept(frame);
+        // Pending is saved work, not an offer: only GET may advance it to offered.
+        for (const frame of hello.unresolved) if (!frame.erasedAt && frame.stage === 'offered') await accept(frame);
         if (halted || stopped) break;
         streamController = new AbortController();
         const response = await fetchImpl(url, { headers: { authorization: `Bearer ${token}`, 'Last-Event-ID': '0' }, signal: AbortSignal.any([controller.signal, streamController.signal]) });

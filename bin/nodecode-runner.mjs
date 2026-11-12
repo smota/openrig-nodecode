@@ -202,7 +202,8 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   const idle = () => { activity.stopBeats(); activity.startIdleBeats({ nativeRef }); };
   const work = () => { if (!ending) activity.startWorkBeats(turns.turnId); };
   const maybeCloseInput = () => {
-    if (inputEnded && ready && !resumeCheckpoint && !navigationCommand && !turns.busy && !turns.queue.length && ![...questions.values()].some(entry => !entry.answered) && child?.stdin?.writable) child.stdin.end();
+    const dispatchable = turns.queue.some(prompt => typeof prompt === 'string' || !channel?.halted);
+    if (inputEnded && ready && !resumeCheckpoint && !navigationCommand && !turns.busy && !dispatchable && ![...questions.values()].some(entry => !entry.answered) && child?.stdin?.writable) child.stdin.end();
   };
   const start = prompt => {
     const managed = typeof prompt === 'object' ? prompt : null;
@@ -221,8 +222,9 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   };
   const drain = () => {
     if (!ready || ending || resumeCheckpoint || navigationCommand || turns.busy) return;
-    if (typeof turns.queue[0] === 'object' && channel?.halted) return;
-    const prompt = turns.dequeue();
+    // Retain quarantined managed custody in this FIFO while explicit person input remains usable.
+    const index = channel?.halted ? turns.queue.findIndex(prompt => typeof prompt === 'string') : 0;
+    const prompt = index < 0 ? undefined : turns.queue.splice(index, 1)[0];
     if (prompt !== undefined) start(prompt);
     else { idle(); maybeCloseInput(); }
   };

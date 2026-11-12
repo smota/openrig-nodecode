@@ -513,6 +513,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       if (nativeTurn && (!terminalId || terminalId !== nativeTurn.id)) return;
       if (managedTurn && (!managedTurn.nativeTurnId || (event?.turn_id ?? payload.frame?.turn_id) !== managedTurn.nativeTurnId)) return;
       if (!subtype || (turns.turnId && (event.turn_id ?? payload.frame.turn_id) && turns.turnId !== (event.turn_id ?? payload.frame.turn_id))) return;
+      const managedCancellationTerminal = nativeTurn && cancellation?.epoch === nativeTurn && cancellation.written;
       if (nativeTurn) {
         const epoch = nativeTurn; epoch.closed = true; completedTurns.add(epoch.id);
         void channel?.turn(epoch.id, 'closed', epoch.acceptedTurnIds); nativeTurn = null;
@@ -529,7 +530,8 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
       if (ending) return;
       activity.stopBeats();
       if (subtype === 'error') await post('Notification', 'runtime_error', { turnId: turns.turnId });
-      if (subtype === 'cancelled') { await activity.withdrawAll('turn_cancelled'); questions.clear(); }
+      // The standing native question board is unbound: a managed target's end cannot erase unrelated custody.
+      if (subtype === 'cancelled' && !managedCancellationTerminal) { await activity.withdrawAll('turn_cancelled'); questions.clear(); }
       turns.end();
       tools.clear(); reasoning.clear(); lastBeat = -Infinity; cancelRequested = false;
       drain();

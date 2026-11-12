@@ -1190,3 +1190,30 @@ test('queued native admission does not fabricate an opened current cancellation 
   assert.equal(r.posts.some(p => p.type === 'turn'), false);
   assert.equal(r.commands.some(c => c.type === 'cancel_turn'), false);
 });
+
+test('persistent unbound post-write question survives the managed cancelled terminal and keeps manual answer custody', async t => {
+  for (const earlyChoice of [false, true]) await t.test(earlyChoice ? 'choice also attempted while fenced' : 'choice after terminal', async t => {
+    let operator;
+    const r = await cancelScenario(t, {
+      frames: earlyChoice ? [resumed(), [300, nativeEnd('E', 'turn.cancelled')]] : [resumed()],
+      onCommand: [
+        { type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] },
+        { type: 'cancel_turn', correlate: true, frames: [nativeCancelResult('E'), question([{ ...q, question_id: 'persistent-Q', session_id: 'ref' }]), ...(earlyChoice ? [] : [nativeEnd('E', 'turn.cancelled')])] },
+        action('Yes', 'wrong-successor'),
+      ],
+      onAsk: () => { setTimeout(() => operator.write('Yes\n'), 25).unref(); return { ok: true, askId: 'persistent-unbound', state: 'pending' }; },
+      onPoll: async () => { await pause(30); return { state: 'pending' }; },
+      onPost(body) { if (body.type === 'result') return { receipt: { version: 1, runId: 'run-1', requestId: 'cancel-E', sequence: 1, kind: 'cancel', stage: 'completed', payload: { target: { runId: 'run-1', nativeTurnId: 'E' } } } }; },
+      start({ input, error }) {
+        operator = input;
+        if (earlyChoice) { let sent = false; error.on('data', bytes => { if (!sent && bytes.toString().includes('Question')) { sent = true; input.write('Yes\n'); } }); }
+      },
+    });
+    assert.equal(r.commands.some(c => c.type === 'start_turn' && c.request.prompt === 'Yes'), false, 'question answer became a successor prompt');
+    assert.deepEqual(r.commands.filter(c => c.type === 'answer_question').map(c => [c.question_id, c.answer]), [['persistent-Q', 'Yes']]);
+    assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 1);
+    assert.equal(r.requests.some(req => req.url.endsWith('/withdraw') && req.body?.reason === 'turn_cancelled'), false);
+    const permission = r.requests.find(req => req.url === '/api/activity/permission-requests').body;
+    assert.equal(Object.hasOwn(permission, 'runId'), false); assert.equal(Object.hasOwn(permission, 'nativeTurnId'), false);
+  });
+});

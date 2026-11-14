@@ -2,7 +2,7 @@
 export function createRunnerChannel({ env, enqueue, prepareCancel, acceptCancel, fetchImpl = globalThis.fetch }) {
   const runId = env.OPENRIG_RUN_ID, token = env.OPENRIG_ACTIVITY_HOOK_TOKEN;
   const base = env.OPENRIG_URL || (env.OPENRIG_PORT ? `http://${env.OPENRIG_HOST || '127.0.0.1'}:${env.OPENRIG_PORT}` : '');
-  if (!runId || !token || !base) return null;
+  if (!runId || !token?.startsWith('oag_') || !base) return null;
   const url = `${base.replace(/\/+$/, '')}/api/activity/runner-channel`;
   const controller = new AbortController();
   const entries = new Map(); // Retained for this entire managed process; never pruned on reconnect.
@@ -17,12 +17,13 @@ export function createRunnerChannel({ env, enqueue, prepareCancel, acceptCancel,
     const timer = setTimeout(finish, 100); controller.signal.addEventListener('abort', finish, { once: true });
     if (stopped) finish();
   });
+  const retryableFailure = async response => response.status >= 500 || [408, 429].includes(response.status)
+    || response.status === 409 && ['runner_grant_pending', 'runner_grant_unverified'].includes((await response.json().catch(() => null))?.code);
   const request = async body => {
     const response = await fetchImpl(url, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify(body), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(2000)]) });
     if (!response.ok) {
-      const pendingGrant = response.status === 409 && (await response.json().catch(() => null))?.code === 'runner_grant_pending';
-      if (!pendingGrant && response.status < 500 && ![408, 429].includes(response.status)) halted = true;
+      if (!await retryableFailure(response)) halted = true;
       throw new Error('channel unavailable');
     }
     return response.json();
@@ -77,7 +78,7 @@ export function createRunnerChannel({ env, enqueue, prepareCancel, acceptCancel,
   };
   const consume = async response => {
     if (!response.ok || !response.headers.get('content-type')?.startsWith('text/event-stream')) {
-      if (response.status < 500) halted = true;
+      if (response.ok || !await retryableFailure(response)) halted = true;
       await response.body?.cancel(); return;
     }
     const reader = response.body.getReader(), decoder = new TextDecoder();

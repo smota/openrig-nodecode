@@ -80,6 +80,8 @@ remain available. Reconnect retains request custody for the entire runner
 process and never resubmits an acknowledged native write. A replacement process
 cannot reconstruct that map and does not replay uncertain prior effects.
 
+The optional channel starts only with a run ID and the existing bound-credential hint (`oag_` token prefix); an inherited run ID with a legacy install token does not claim native authority. Core still authenticates the credential. Explicit pending/unverified standing retries both POSTs and SSE with the same credential, reports and process-lifetime maps. Positive stale/revoked and other permanent refusals remain strict; no rejected bound request falls back to install authority.
+
 The run credential stays in the runner and is removed from native/profile
 subprocess environments. No command file or global Core event subscription is
 used. When Core supports named cancellation, the runner reports owned native

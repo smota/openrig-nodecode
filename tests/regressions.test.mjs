@@ -60,7 +60,7 @@ async function runner(t, { frames = [resumed()], onCommand = [], setup = () => {
   const bin = path.join(dir, 'fake.mjs');
   fs.writeFileSync(bin, `#!${process.execPath}\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nif (process.argv[2] === 'profile') { fs.appendFileSync(${JSON.stringify(path.join(dir, 'profile-private-env'))}, JSON.stringify({token:Object.hasOwn(process.env,'OPENRIG_ACTIVITY_HOOK_TOKEN'),run:Object.hasOwn(process.env,'OPENRIG_RUN_ID')})+'\\n'); fs.appendFileSync(process.env.TEST_PROFILE_CALLS, JSON.stringify(process.argv.slice(2))+'\\n'); const names=JSON.parse(fs.readFileSync(process.env.TEST_PROFILE_NAMES)); if(process.argv[3]==='list') console.log(names.map(name=>'  '+name+'  '+process.env.TEST_PROFILE_ROOT+'/'+name).join('\\n')); else if(process.argv[3]==='create') { names.push(process.argv[4]); fs.writeFileSync(process.env.TEST_PROFILE_NAMES,JSON.stringify(names)); fs.mkdirSync(process.env.TEST_PROFILE_ROOT+'/'+process.argv[4]+'/cells/linked-skills',{recursive:true}); } } else if (process.argv.includes('gateway')) { ${gateway || `fs.writeFileSync(${JSON.stringify(gatewayLog)}, JSON.stringify({env:process.env,argv:process.argv.slice(2),tty:process.stdout.isTTY, pipe:fs.fstatSync(1).isFIFO(),ownGroup:(()=>{try{process.kill(-process.pid,0);return true}catch{return false}})()})); fs.writeFileSync(${JSON.stringify(path.join(home, 'store/main.owner'))}, JSON.stringify({pid:${process.pid},port:${api.port}}));`} } else {\nfs.writeFileSync(${JSON.stringify(path.join(dir, 'private-env'))}, JSON.stringify({ token: Object.hasOwn(process.env,'OPENRIG_ACTIVITY_HOOK_TOKEN'), run: Object.hasOwn(process.env,'OPENRIG_RUN_ID') })); fs.writeFileSync(${JSON.stringify(path.join(dir, 'argv'))}, JSON.stringify(process.argv.slice(2))); fs.writeFileSync(${JSON.stringify(path.join(dir, 'pid'))}, String(process.pid));\nif(process.env.TEST_CLOSE_STDIN) { setTimeout(()=>{process.stdin.destroy(); try { fs.closeSync(0); } catch {}}, 100); setTimeout(()=>{process.exitCode=19;}, 1500); }\nconst send = f => process.stdout.write(JSON.stringify(f)+'\\n');\nfor (const [delay,frame] of ${JSON.stringify(frames.map(f => Array.isArray(f) ? f : [0, f]))}) setTimeout(()=>send(frame), delay);\nlet navigationPending = false;\nconst actions = ${JSON.stringify(onCommand)};\nreadline.createInterface({input:process.stdin}).on('line', line => { fs.appendFileSync(${JSON.stringify(log)}, line+'\\n'); const frame=JSON.parse(line); if(frame.type==='start_turn' && navigationPending) process.stderr.write('EARLY_START\\n'); for(const a of actions) if(a.type===frame.type && (!a.prompt || a.prompt===frame.request?.prompt)) { if(a.delay && frame.type==='navigate_checkpoint') navigationPending=true; const respond=()=>{ for(const f of a.frames) { if(a.correlate && f.payload?.type==='gateway_turn_command_result') f.payload.result.command_id=frame.command_id; send(f); } if(frame.type==='navigate_checkpoint') navigationPending=false; }; if(a.delay) setTimeout(respond,a.delay); else respond(); } });\n}`);
   fs.chmodSync(bin, 0o755);
-  const env = { PATH: process.env.PATH, NODECODE_BIN: bin, NODECODE_HOME: home, OPENRIG_HOME: path.join(dir, 'rig'), OPENRIG_URL: api.url, OPENRIG_ACTIVITY_HOOK_TOKEN: 'hook-token', OPENRIG_SESSION_NAME: 'pod-worker@rig', OPENRIG_NODE_ID: 'node', OPENRIG_LAUNCH_RESULT: path.join(dir, 'record'), ...overrides };
+  const env = { PATH: process.env.PATH, NODECODE_BIN: bin, NODECODE_HOME: home, OPENRIG_HOME: path.join(dir, 'rig'), OPENRIG_URL: api.url, OPENRIG_ACTIVITY_HOOK_TOKEN: onChannel && overrides.OPENRIG_RUN_ID ? 'oag_native_fixture' : 'hook-token', OPENRIG_SESSION_NAME: 'pod-worker@rig', OPENRIG_NODE_ID: 'node', OPENRIG_LAUNCH_RESULT: path.join(dir, 'record'), ...overrides };
   const context = { dir, home, env, input, output, error, api, gatewayLog, log, argv };
   await setup(context);
   let timer;
@@ -712,7 +712,7 @@ test('run channel accepts once, reports native IDs and returns only the dedicate
   const r = await runner(t, {
     env: { OPENRIG_RUN_ID: 'run-1' },
     onChannel(req, res, { input }) {
-      assert.equal(req.headers.authorization, 'Bearer hook-token');
+      assert.equal(req.headers.authorization, 'Bearer oag_native_fixture');
       if (req.method === 'GET') {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         res.write(`id: 1\nevent: request\ndata: ${JSON.stringify(frame)}\n\nid: 1\nevent: request\ndata: ${JSON.stringify(frame)}\n\n`);
@@ -744,14 +744,15 @@ test('new run credential and run ID never reach the native child or profile help
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(r.dir, 'private-env'))), { token: false, run: false });
 });
 
-async function channelScenario(t, { operations, onCommand, frames, start, loseAck = false, loseResult = false, reconnect = false, mutate, expectedResults = operations.length, expectedCode = 0 }) {
+async function channelScenario(t, { operations, onCommand, frames, start, loseAck = false, loseResult = false, reconnect = false, transient, streamFailure, mutate, expectedResults = operations.length, expectedCode = 0 }) {
   const posts = [], hellos = [], receipts = new Map();
-  let streams = 0, droppedAck = false, droppedResult = false;
+  let streams = 0, droppedAck = false, droppedResult = false, transientHits = 0;
   const r = await runner(t, {
     env: { OPENRIG_RUN_ID: 'run-1' }, frames, onCommand, start,
     onChannel(req, res, { input }) {
       if (req.method === 'GET') {
         streams++;
+        if (streamFailure && streams === 2) { res.writeHead(409); res.end(JSON.stringify({ code: streamFailure })); return; }
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         for (const frame of operations) {
           const data = JSON.stringify(frame);
@@ -764,6 +765,7 @@ async function channelScenario(t, { operations, onCommand, frames, start, loseAc
         return;
       }
       const body = req.body; posts.push(body);
+      if (transient && body.type === transient.type && transientHits === 0) { transientHits++; res.writeHead(409); res.end(JSON.stringify({ code: transient.code })); return; }
       if (body.type === 'hello') {
         hellos.push(body);
         return { version: 1, runId: 'run-1', capabilities: { input: true, wake: true, cancel: false },
@@ -779,7 +781,7 @@ async function channelScenario(t, { operations, onCommand, frames, start, loseAc
     },
   });
   assert.equal(r.code, expectedCode, r.stderr);
-  return { ...r, posts, hellos };
+  return { ...r, posts, hellos, streams, transientHits };
 }
 const managed = (sequence, kind = 'wake', text = `question-${sequence}`) => ({ version: 1, runId: 'run-1', requestId: `request-${sequence}`, sequence, kind, stage: 'offered', payload: kind === 'wake' ? { question: text } : { text } });
 const nativeResult = (id, status = 'accepted') => ({ payload: { type: 'gateway_turn_command_result', result: { command: 'start_turn', status, response: { turn_id: id } } } });
@@ -949,11 +951,61 @@ test('reconnect hello leaves pending requests for the actual offered transition'
   assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['first', 'second']);
 });
 
+test('an inherited run ID with a legacy credential preserves ordinary input without a native claim', async t => {
+  const calls = [];
+  const r = await runner(t, { env: { OPENRIG_RUN_ID: 'inherited', OPENRIG_ACTIVITY_HOOK_TOKEN: 'hook-token' },
+    onChannel(req) { calls.push(req.method); return { version: 1, runId: 'inherited', capabilities: { input: true, wake: true, cancel: false }, receipts: [], unresolved: [] }; },
+    onCommand: [action('ordinary', 'person')], start({ input }) { input.end('ordinary\n'); } });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['ordinary']);
+  assert.deepEqual(calls, []);
+  assert.ok(r.hooks.length > 0); assert.ok(r.hooks.every(h => !Object.hasOwn(h, 'runId') && !Object.hasOwn(h, 'nativeTurnId')));
+});
+
+test('pending and unverified channel posts retain the same report until recovery without replay', async t => {
+  for (const code of ['runner_grant_pending', 'runner_grant_unverified']) for (const type of ['hello', 'ack', 'result']) await t.test(`${code} ${type}`, async t => {
+    const r = await channelScenario(t, { operations: [managed(1)], transient: { type, code },
+      onCommand: [action('question-1', 'one', [nativeText('one', 'answer')])],
+      start({ input }) { setTimeout(() => input.end(), 1200).unref(); } });
+    assert.equal(r.transientHits, 1);
+    assert.equal(r.commands.filter(c => c.type === 'start_turn').length, 1);
+    const retried = r.posts.filter(p => p.type === type); assert.equal(retried.length, 2);
+    assert.deepEqual(retried[0], retried[1]);
+    assert.equal(r.posts.filter(p => p.type === 'result').at(-1).result.answer, 'answer');
+  });
+});
+
+test('pending and unverified SSE reconnect preserve retained receiver custody', async t => {
+  for (const code of ['runner_grant_pending', 'runner_grant_unverified']) await t.test(code, async t => {
+    const r = await channelScenario(t, { operations: [managed(1)], reconnect: true, streamFailure: code,
+      onCommand: [action('question-1', 'one', [nativeText('one', 'answer')], 'turn.completed', 300)],
+      start({ input }) { setTimeout(() => input.end(), 1500).unref(); } });
+    assert.ok(r.streams >= 3); assert.ok(r.hellos.length >= 3);
+    assert.equal(r.hellos[0].retained, false); assert.ok(r.hellos.slice(1).every(h => h.retained));
+    assert.equal(r.commands.filter(c => c.type === 'start_turn').length, 1);
+    assert.equal(r.posts.filter(p => p.type === 'ack').length, 1);
+    assert.equal(r.posts.filter(p => p.type === 'result').length, 1);
+    assert.equal(r.posts.find(p => p.type === 'result').result.answer, 'answer');
+  });
+});
+
+test('permanent SSE authority and protocol refusals do not reconnect or execute', async t => {
+  for (const [status, code] of [[401, 'runner_grant_revoked'], [409, 'runner_grant_stale'], [409, 'unknown_conflict'], [400, 'runner_grant_unverified']]) await t.test(code, async t => {
+    let posts = 0, gets = 0;
+    const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1' }, onChannel(req, res) {
+      if (req.method === 'POST') { posts++; return { version: 1, runId: 'run-1', capabilities: { input: true, wake: true, cancel: false }, receipts: [], unresolved: [] }; }
+      gets++; res.writeHead(status); res.end(JSON.stringify({ code }));
+    }, start({ input }) { setTimeout(() => input.end(), 200).unref(); } });
+    assert.equal(r.code, 0, r.stderr); assert.equal(posts, 1); assert.equal(gets, 1);
+    assert.equal(r.commands.some(c => c.type === 'start_turn'), false);
+  });
+});
+
 test('startup retries only explicit pending-grant standing with the same run credential', async t => {
   let hellos = 0; const posts = [], frame = managed(1, 'input', 'after-activation');
   const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1' }, onCommand: [action('after-activation', 'activated')],
     onChannel(req, res, { input }) {
-      assert.equal(req.headers.authorization, 'Bearer hook-token');
+      assert.equal(req.headers.authorization, 'Bearer oag_native_fixture');
       if (req.body?.type === 'hello') {
         posts.push(req.body);
         if (++hellos === 1) { res.writeHead(409); res.end(JSON.stringify({ code: 'runner_grant_pending' })); return; }

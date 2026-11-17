@@ -1120,11 +1120,11 @@ test('non-pending authority and protocol failures stay permanent rather than ret
 });
 
 const nativeCancelResult = (id, status = 'accepted', code = 'ok') => ({ payload: { type: 'gateway_turn_command_result', result: { command: 'cancel_turn', status, code, response: { turn_id: id } } } });
-async function cancelScenario(t, { frames = [resumed(), [450, nativeEnd('E')]], onCommand, prepare, onPost, onAsk, onPoll, start, duplicate = false, env: overrides = {}, expectedCode = 0 } = {}) {
+async function cancelScenario(t, { frames = [resumed(), [450, nativeEnd('E')]], onCommand, prepare, onPost, onAsk, onPoll, start, setup, duplicate = false, env: overrides = {}, expectedCode = 0 } = {}) {
   const posts = [], request = { version: 1, runId: 'run-1', requestId: 'cancel-E', sequence: 1, kind: 'cancel', stage: 'offered', payload: { target: { runId: 'run-1', nativeTurnId: 'E' } } };
   let stream, offered = false, opened = false;
   const offer = () => { if (stream && opened && !offered) { offered = true; const frame = `id: 1\nevent: request\ndata: ${JSON.stringify(request)}\n\n`; stream.write(frame); if (duplicate) stream.write(frame); } };
-  const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1', ...overrides }, frames, onAsk, onPoll,
+  const r = await runner(t, { env: { OPENRIG_RUN_ID: 'run-1', ...overrides }, frames, onAsk, onPoll, setup,
     onCommand: onCommand ?? [
       { type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] },
       { type: 'cancel_turn', correlate: true, frames: [nativeCancelResult('E'), nativeEnd('E', 'turn.cancelled')] },
@@ -1225,6 +1225,33 @@ test('pre-write cancelled terminal preserves the same unbound question across de
     assert.equal(r.requests.some(req => req.url.endsWith('/withdraw') && req.body?.reason === 'turn_cancelled'), false);
     assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'not-this-turn');
   });
+});
+
+test('native exit before cancellation write rejects accepted preparation without a fabricated outcome', async t => {
+  for (const phase of ['ack', 'prepare']) await t.test(phase, async t => {
+    let pidFile;
+    const exitNative = async () => { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 'SIGTERM'); await pause(150); };
+    const r = await cancelScenario(t, { expectedCode: 1,
+      onCommand: [{ type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] }],
+      onPost: phase === 'ack' ? async body => { if (body.type === 'ack') await exitNative(); } : undefined,
+      prepare: phase === 'prepare' ? async () => { await exitNative(); return { invalid: true }; } : undefined,
+      start({ dir }) { pidFile = path.join(dir, 'pid'); },
+    });
+    assert.equal(r.commands.some(c => c.type === 'cancel_turn'), false);
+    assert.equal(r.posts.some(p => p.type === 'submitted' || p.type === 'result'), false);
+    assert.deepEqual(r.posts.find(p => p.type === 'rejected')?.result, { kind: 'cancel', applied: false, reason: 'native_unavailable' });
+  });
+});
+
+test('stopping during managed preparation never writes an untracked manual cancellation', async t => {
+  const r = await cancelScenario(t, { expectedCode: 143,
+    setup({ env }) { fs.appendFileSync(env.NODECODE_BIN, "\nprocess.on('SIGTERM',()=>setTimeout(()=>process.exit(0),100));\n"); },
+    onCommand: [{ type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] }],
+    async prepare() { process.emit('SIGTERM'); await pause(150); return { invalid: true }; },
+  });
+  assert.equal(r.commands.some(c => c.type === 'cancel_turn'), false);
+  assert.deepEqual(r.posts.find(p => p.type === 'rejected')?.result, { kind: 'cancel', applied: false, reason: 'native_unavailable' });
+  assert.equal(r.posts.some(p => p.type === 'submitted' || p.type === 'result'), false);
 });
 
 test('failed pre-write preparation rejects without an invented cancellation outcome', async t => {

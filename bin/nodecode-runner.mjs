@@ -237,12 +237,13 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   async function acceptCancellation(entry, accepted) {
     const operation = entry.operation;
     if (!accepted) { releaseCancellation(operation); return; }
-    if (operation?.outcome || ending) {
-      void channel.cancelResult(entry, operation?.outcome ?? 'not-supported', false, ending ? 'native_unavailable' : undefined);
+    if (operation?.outcome) {
+      void channel.cancelResult(entry, operation.outcome, false);
       releaseCancellation(operation); return;
     }
     if (cancellation !== operation) return;
     operation.accepted = true;
+    if (ending) { finishCancellation(undefined, 'native_unavailable'); return; }
     try {
       await activity.drainAnswers();
       while (!ending && cancellation === operation) {
@@ -349,9 +350,9 @@ export async function main({ argv = process.argv.slice(2), env = process.env, in
   };
   const finish = async (code, { kill = false } = {}) => {
     if (ending) return;
-    if (kill && !cancellation?.written) cancel();
+    if (kill && !cancellation) cancel();
     ending = true;
-    if (cancellation?.accepted) finishCancellation(cancellation.written ? 'requested' : 'not-supported', 'native_outcome_unknown');
+    if (cancellation) finishCancellation(cancellation.written ? 'requested' : undefined, cancellation.written ? 'native_outcome_unknown' : 'native_unavailable');
     if (managedTurn && !managedTurn.terminal) {
       managedTurn.terminal = true;
       void channel.result(managedTurn, 'unknown', { submissionUnknown: !managedTurn.nativeTurnId });

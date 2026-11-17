@@ -155,7 +155,7 @@ The opt-in test creates a temporary one-seat rig, observes startup and a real `p
 
 ### Run-channel compatibility (current Core)
 
-The optional native channel requires Core's merged run-bound input/wake and named-turn cancellation contracts (series PR1–4). Other-runner adoption (PR5) is not a prerequisite: Nodecode is an independent preset-owned consumer. Current deterministic compatibility proof targets Core main `8541655ad8b0d958cb0ea34df7615e41302877b0`; validation records pin the exact revisions; a local proof is not a claim of support in every released version.
+The optional native channel requires Core's merged run-bound input/wake and named-turn cancellation contracts (series PR1–4). Other-runner adoption (PR5) is not a prerequisite: Nodecode is an independent preset-owned consumer. Current deterministic compatibility proof targets Core main `fe0d346df17e477efcdb3dc9c840275933e6eff1`; validation records pin the exact revisions; a local proof is not a claim of support in every released version.
 
 - SSE receipt framing uses Core's optional `runner-frame-chars` comment as an exact UTF-16 JSON-length hint, including grouped request metadata. Legacy frames remain bounded at 6 MiB plus 64 KiB framing overhead. Each complete frame is processed independently; ordered group membership remains immutable across reoffers and receipts.
 - A matching Nodecode terminal event (`turn.completed`, `turn.failed` or `turn.cancelled`) ends preparation for that exact native turn immediately, even while an accepted-ACK or preparation HTTP response is pending. Later callbacks cannot cancel a successor. A pre-write terminal reports `not-this-turn` only after Core accepts custody; failed ACKs never fabricate accepted or completed custody.

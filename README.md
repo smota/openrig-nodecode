@@ -152,3 +152,13 @@ Not proved: behaviour under tmux pane loss/daemon restart mid-turn.
 Run `npm run test:live` to exercise the installed OpenRig daemon on `:7433` through `rig` and tmux. The daemon must already be running, with the nodecode runtime installed and authenticated; `rig` and `tmux` must be on `PATH`. This uses the installed connector, not necessarily this checkout.
 
 The opt-in test creates a temporary one-seat rig, observes startup and a real `proof.txt` write, snapshots and resumes the seat, checks recalled session memory in the pane, and rejects an unknown runtime. An `after()` hook deletes the throwaway rig and temporary directory. Ordinary `npm test` skips it unless `OPENRIG_LIVE_RIG=1`; live turns can consume model quota and each polling step allows up to 120 seconds.
+
+### Run-channel compatibility (current Core)
+
+The optional native channel requires Core's merged run-bound input/wake and named-turn cancellation contracts (series PR1–4). Other-runner adoption (PR5) is not a prerequisite: Nodecode is an independent preset-owned consumer. Current deterministic compatibility proof targets Core main `8541655ad8b0d958cb0ea34df7615e41302877b0`; validation records pin the exact revisions; a local proof is not a claim of support in every released version.
+
+- SSE receipt framing uses Core's optional `runner-frame-chars` comment as an exact UTF-16 JSON-length hint, including grouped request metadata. Legacy frames remain bounded at 6 MiB plus 64 KiB framing overhead. Each complete frame is processed independently; ordered group membership remains immutable across reoffers and receipts.
+- A matching Nodecode terminal event (`turn.completed`, `turn.failed` or `turn.cancelled`) ends preparation for that exact native turn immediately, even while an accepted-ACK or preparation HTTP response is pending. Later callbacks cannot cancel a successor. A pre-write terminal reports `not-this-turn` only after Core accepts custody; failed ACKs never fabricate accepted or completed custody.
+- Failed preparation before any native cancellation write reports existing `rejected` metadata (`applied: false`, reason, no cancellation outcome). Previously withdrawn approvals remain withdrawn. A valid pending withdrawal continues to wait; existing hello/receipt/SSE authority retries retain their original IDs. Native questions remain under their existing question IDs and can still be answered manually.
+
+No Pi-specific settlement event, queue clearing, automatic prompt replay, new cancellation outcome or provider qualification is inferred. Existing profile, model, resume and permission behavior remains intact.

@@ -9,6 +9,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { main } from '../bin/nodecode-runner.mjs';
 import { createActivity } from '../src/activity.mjs';
+import { createRunnerChannel } from '../src/runner-channel.mjs';
 import * as activityModule from '../src/activity.mjs';
 import { probeSession } from '../src/session-probe.mjs';
 import * as skills from '../src/skills.mjs';
@@ -744,7 +745,7 @@ test('new run credential and run ID never reach the native child or profile help
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(r.dir, 'private-env'))), { token: false, run: false });
 });
 
-async function channelScenario(t, { operations, onCommand, frames, start, loseAck = false, loseResult = false, reconnect = false, transient, streamFailure, mutate, expectedResults = operations.length, expectedCode = 0 }) {
+async function channelScenario(t, { operations, onCommand, frames, start, loseAck = false, loseResult = false, reconnect = false, transient, streamFailure, mutate, expectedResults = operations.length, expectedCode = 0, wire }) {
   const posts = [], hellos = [], receipts = new Map();
   let streams = 0, droppedAck = false, droppedResult = false, transientHits = 0;
   const r = await runner(t, {
@@ -757,8 +758,8 @@ async function channelScenario(t, { operations, onCommand, frames, start, loseAc
         for (const frame of operations) {
           const data = JSON.stringify(frame);
           // Exercise UTF-8/chunk/framing boundaries and duplicate delivery.
-          res.write(`id: ${frame.sequence}\r\nevent: request\r\ndata: ${data}`);
-          res.write('\r\n\r\n');
+          if (wire) wire(res, frame, data);
+          else { res.write(`id: ${frame.sequence}\r\nevent: request\r\ndata: ${data}`); res.write('\r\n\r\n'); }
         }
         if (reconnect && streams === 1) res.end();
         else return new Promise(resolve => res.on('close', resolve));
@@ -788,6 +789,60 @@ const nativeResult = (id, status = 'accepted') => ({ payload: { type: 'gateway_t
 const nativeEnd = (id, type = 'turn.completed') => ({ payload: { type: 'session_stream_event', frame: { event: { type, turn_id: id } } } });
 const nativeText = (id, text) => ({ payload: { type: 'item_delta', turn_id: id, delta: { type: 'text', text } } });
 const action = (prompt, id, extra = [], type = 'turn.completed', delay = 0) => ({ type: 'start_turn', prompt, correlate: true, delay, frames: [nativeResult(id), ...extra, nativeEnd(id, type)] });
+
+test('hinted ordinary and grouped frames preserve full native input above the legacy bound', async t => {
+  for (const grouped of [false, true]) await t.test(grouped ? 'group' : 'ordinary', async t => {
+    const text = '\0'.repeat(2 * 1024 * 1024), frame = managed(1, 'input', text);
+    if (grouped) frame.memberIds = [frame.requestId, 'member-two'];
+    frame.destination = 'worker-🧪';
+    const r = await channelScenario(t, { operations: [frame, managed(2, 'input', 'successor')],
+      wire(res, frame, data) {
+        if (frame.sequence === 1) {
+          const header = `: runner-frame-chars=${data.length}\n`;
+          res.write(header.slice(0, 9));
+          res.write(header.slice(9) + `id: 1\nevent: request\ndata: ` + data.slice(0, 101));
+          res.write(data.slice(101) + '\n\n');
+        } else res.write(`id: 2\nevent: request\ndata: ${data}\n\n`);
+      }, onCommand: [action(text, 'large'), action('successor', 'successor')] });
+    const prompts = r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt);
+    assert.equal(prompts.length, 2); assert.equal(prompts[0] === text, true); assert.equal(prompts[1], 'successor');
+    assert.equal(r.posts.filter(p => p.type === 'ack').length, 2);
+  });
+});
+
+test('channel framing and group identity reject poison frames without consuming native custody', async t => {
+  for (const mode of ['coalesced', 'legacy-oversize', 'unsafe-hint', 'bad-hint', 'mismatched-hint', 'member-reoffer', 'member-receipt']) await t.test(mode, async () => {
+    const first = managed(1, 'input', mode === 'coalesced' ? '\0'.repeat(600 * 1024) : mode === 'legacy-oversize' ? '\0'.repeat(2 * 1024 * 1024) : 'first');
+    if (mode.startsWith('member-')) first.memberIds = [first.requestId, 'two', 'three'];
+    const second = mode === 'member-reoffer' ? { ...first, memberIds: [first.requestId, 'three', 'two'] } : managed(2, 'input', first.payload.text);
+    const wire = frame => `id: ${frame.sequence}\nevent: request\ndata: ${JSON.stringify(frame)}\n\n`;
+    const data = JSON.stringify(first), prefix = mode === 'unsafe-hint' ? ': runner-frame-chars=9007199254740991\n'
+      : mode === 'bad-hint' ? ': runner-frame-chars=invalid\n' : mode === 'mismatched-hint' ? `: runner-frame-chars=${data.length + 1}\n` : '';
+    const bytes = new TextEncoder().encode(prefix + wire(first) + (['coalesced', 'member-reoffer'].includes(mode) ? wire(second) : ''));
+    const queued = [], posts = [];
+    let cancelled, finished;
+    const readerClosed = new Promise(resolve => { cancelled = resolve; });
+    const completed = new Promise(resolve => { finished = resolve; });
+    const channel = createRunnerChannel({ env: { OPENRIG_RUN_ID: 'run-1', OPENRIG_ACTIVITY_HOOK_TOKEN: 'oag_fixture', OPENRIG_URL: 'http://fixture' },
+      enqueue(entry) { queued.push(entry); if (queued.length === 2) finished(); },
+      async fetchImpl(_url, options) {
+        if (options.method === 'POST') {
+          const body = JSON.parse(options.body); posts.push(body);
+          if (body.type === 'hello') return Response.json({ version: 1, runId: 'run-1', capabilities: { input: true, wake: false, cancel: false }, receipts: [], unresolved: [] });
+          const source = body.requestId === first.requestId ? first : second;
+          return Response.json({ receipt: { ...source, ...(mode === 'member-receipt' ? { memberIds: [first.requestId, 'three', 'two'] } : {}), stage: 'accepted' } });
+        }
+        return new Response(new ReadableStream({ start(controller) { controller.enqueue(bytes); options.signal.addEventListener('abort', () => { try { controller.close(); } catch {} }, { once: true }); }, cancel() { cancelled(); } }), { headers: { 'content-type': 'text/event-stream' } });
+      } });
+    channel.start();
+    let timer;
+    try { await Promise.race([mode === 'coalesced' ? completed : readerClosed, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('channel did not process/cancel frame')), 2000); })]); }
+    finally { clearTimeout(timer); await channel.close(); }
+    assert.equal(queued.length, mode === 'coalesced' ? 2 : mode === 'member-reoffer' ? 1 : 0);
+    assert.equal(posts.filter(p => p.type === 'ack').length, mode === 'coalesced' ? 2 : mode.startsWith('member-') ? 1 : 0);
+    if (mode.startsWith('member-')) assert.equal(channel.halted, true);
+  });
+});
 
 test('busy managed inputs and two dedicated wakes reuse the native FIFO without mixing answers', async t => {
   const r = await channelScenario(t, {
@@ -1081,8 +1136,8 @@ async function cancelScenario(t, { frames = [resumed(), [450, nativeEnd('E')]], 
       if (body.type === 'hello') return { version: 1, runId: 'run-1', capabilities: { input: true, wake: true, cancel: true }, receipts: [], unresolved: [] };
       if (body.type === 'turn') { if (body.state === 'opened' && body.nativeTurnId === 'E') { opened = true; offer(); } return { accepted: true }; }
       if (body.type === 'cancel-prepare') return prepare ? prepare(body, context) : { receipt: { ...request, stage: 'accepted' }, withdrawal: { confirmed: true, pendingSubmissions: 0, withdrawn: 0 } };
-      if (body.type === 'result') context.input.end();
-      return { receipt: { ...request, stage: { ack: 'accepted', submitted: 'submitted', result: 'completed' }[body.type] } };
+      if (body.type === 'result' || body.type === 'rejected') context.input.end();
+      return { receipt: { ...request, stage: { ack: 'accepted', submitted: 'submitted', result: 'completed', rejected: 'rejected' }[body.type] } };
     },
     start(context) { context.input.write('E\n'); setTimeout(() => context.input.end(), 550).unref(); start?.(context); },
   });
@@ -1099,7 +1154,7 @@ test('named cancellation reports the exact native epoch and confirms only its ca
   assert.ok(r.posts.findIndex(p => p.type === 'cancel-prepare') < r.posts.findIndex(p => p.type === 'submitted'));
 });
 
-test('cancel fences successors before a delayed ack and never targets naturally ended E or successor F', async t => {
+test('cancel releases successors at exact E terminal before a delayed ACK without targeting F', async t => {
   let log;
   const r = await cancelScenario(t, {
     frames: [resumed(), [110, nativeEnd('E')]],
@@ -1108,7 +1163,7 @@ test('cancel fences successors before a delayed ack and never targets naturally 
       if (body.type === 'ack') {
         await pause(180);
         const commands = fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
-        assert.deepEqual(commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['E']);
+        assert.deepEqual(commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['E', 'F']);
       }
     }, start(context) { log = context.log; context.input.write('F\n'); },
   });
@@ -1128,6 +1183,56 @@ test('cancel rechecks E after confirmed withdrawal and preserves a no-effect res
   assert.equal(r.commands.filter(c => c.type === 'cancel_turn').length, 0);
   assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'not-this-turn');
   assert.deepEqual(r.commands.filter(c => c.type === 'start_turn').map(c => c.request.prompt), ['E', 'F']);
+});
+
+test('exact terminal releases pre-write cancellation before delayed ACK or preparation returns', async t => {
+  for (const phase of ['ack', 'prepare']) await t.test(phase, async t => {
+    let log, sawSuccessor = false, observation;
+    const observe = () => observation = (async () => {
+      await pause(300);
+      const commands = fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+      sawSuccessor = commands.some(c => c.type === 'start_turn' && c.request.prompt === 'F');
+    })();
+    const r = await cancelScenario(t, {
+      frames: [resumed(), [130, nativeEnd('E')], [420, nativeEnd('F')]],
+      onCommand: [{ type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] }, { type: 'start_turn', prompt: 'F', correlate: true, frames: [nativeResult('F')] }],
+      onPost: phase === 'ack' ? async body => { if (body.type === 'ack') await observe(); } : undefined,
+      prepare: phase === 'prepare' ? async body => { await observe(); return { receipt: { version: 1, runId: 'run-1', requestId: body.requestId, sequence: 1, kind: 'cancel', stage: 'accepted', payload: { target: { runId: 'run-1', nativeTurnId: 'E' } } }, withdrawal: { confirmed: true, pendingSubmissions: 0, withdrawn: 0 } }; } : undefined,
+      start(context) { log = context.log; context.input.write('F\n'); },
+    });
+    await observation;
+    assert.equal(sawSuccessor, true);
+    assert.equal(r.commands.some(c => c.type === 'cancel_turn'), false);
+    assert.equal(r.posts.filter(p => p.type === 'result').length, 1);
+    assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'not-this-turn');
+  });
+});
+
+test('pre-write cancelled terminal preserves the same unbound question across delayed ACK or preparation', async t => {
+  for (const phase of ['ack', 'prepare']) await t.test(phase, async t => {
+    let operator;
+    const r = await cancelScenario(t, {
+      frames: [resumed(), [90, question([{ ...q, question_id: 'prewrite-Q', session_id: 'ref' }])], [130, nativeEnd('E', 'turn.cancelled')]],
+      onCommand: [{ type: 'start_turn', prompt: 'E', correlate: true, frames: [nativeResult('E')] }],
+      onPost: async body => { if (body.type === phase) await pause(300); if (body.type === 'result') { operator.write('Yes\n'); await pause(80); } },
+      prepare: phase === 'prepare' ? async body => { await pause(300); return { receipt: { version: 1, runId: 'run-1', requestId: body.requestId, sequence: 1, kind: 'cancel', stage: 'accepted', payload: { target: { runId: 'run-1', nativeTurnId: 'E' } } }, withdrawal: { confirmed: true, pendingSubmissions: 0, withdrawn: 0 } }; } : undefined,
+      onAsk: () => ({ ok: true, askId: 'prewrite-unbound', state: 'pending' }),
+      onPoll: async () => { await pause(30); return { state: 'pending' }; },
+      start({ input }) { operator = input; },
+    });
+    assert.equal(r.commands.some(c => c.type === 'cancel_turn'), false);
+    assert.deepEqual(r.commands.filter(c => c.type === 'answer_question').map(c => [c.question_id, c.answer]), [['prewrite-Q', 'Yes']]);
+    assert.equal(r.requests.some(req => req.url.endsWith('/withdraw') && req.body?.reason === 'turn_cancelled'), false);
+    assert.equal(r.posts.find(p => p.type === 'result').result.outcome, 'not-this-turn');
+  });
+});
+
+test('failed pre-write preparation rejects without an invented cancellation outcome', async t => {
+  const r = await cancelScenario(t, { prepare: () => ({ invalid: true }) });
+  assert.equal(r.commands.some(c => c.type === 'cancel_turn'), false);
+  const retired = r.posts.find(p => p.type === 'rejected');
+  assert.ok(retired); assert.deepEqual(retired.result, { kind: 'cancel', applied: false, reason: 'preparation_failed' });
+  assert.equal(r.posts.some(p => p.type === 'result' || p.type === 'submitted'), false);
 });
 
 test('cancellation RPC acceptance or normal completion cannot confirm cancellation', async t => {

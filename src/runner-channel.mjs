@@ -1,3 +1,11 @@
+function runnerFrameBound(buffer) {
+  const overhead = 64 * 1024, fallback = { limit: 6 * 1024 * 1024 + overhead };
+  if (!buffer.startsWith(': runner-frame-chars=') || !buffer.includes('\n')) return fallback;
+  const header = /^: runner-frame-chars=([0-9]+)\n/.exec(buffer), chars = header ? Number(header[1]) : NaN;
+  if (!Number.isSafeInteger(chars) || chars < 1 || chars > Number.MAX_SAFE_INTEGER - overhead) throw new Error('Invalid channel frame size');
+  return { limit: chars + overhead, chars };
+}
+
 /** The optional Core channel owns wire custody only; the runner's native queue owns execution. */
 export function createRunnerChannel({ env, enqueue, prepareCancel, acceptCancel, fetchImpl = globalThis.fetch }) {
   const runId = env.OPENRIG_RUN_ID, token = env.OPENRIG_ACTIVITY_HOOK_TOKEN;
@@ -38,6 +46,7 @@ export function createRunnerChannel({ env, enqueue, prepareCancel, acceptCancel,
     const body = { type, runId, requestId: entry.frame.requestId, sequence: entry.frame.sequence, ...extra };
     entry.latest = body;
     entry.reports = entry.reports.then(async () => {
+      if (type !== 'ack' && entry.frame.kind === 'cancel' && entry.accepted !== true) return false;
       const saved = await retry(body);
       if (!saved) return false;
       const receipt = saved.receipt;
@@ -45,9 +54,11 @@ export function createRunnerChannel({ env, enqueue, prepareCancel, acceptCancel,
       if (!receipt || receipt.runId !== runId || receipt.requestId !== body.requestId || receipt.sequence !== body.sequence
         || receipt.version !== 1 || receipt.kind !== entry.frame.kind || receipt.stage !== expectedStage
         || JSON.stringify(receipt.payload) !== JSON.stringify(entry.frame.payload)
+        || JSON.stringify(receipt.memberIds ?? [receipt.requestId]) !== JSON.stringify(entry.frame.memberIds ?? [entry.frame.requestId])
         || (receipt.reconciliation && !(body.result?.ownershipUnknown === true && receipt.reconciliation === 'native_ownership_unknown')) || receipt.erasedAt) {
         halted = true; return false;
       }
+      if (type === 'ack') entry.accepted = true;
       return true;
     }).catch(() => { halted = true; return false; });
     return entry.reports;
@@ -59,8 +70,10 @@ export function createRunnerChannel({ env, enqueue, prepareCancel, acceptCancel,
       || capabilities[raw.kind] !== true || (raw.kind === 'cancel'
         ? raw.payload?.target?.runId !== runId || typeof raw.payload?.target?.nativeTurnId !== 'string' || !raw.payload.target.nativeTurnId
         : typeof raw.payload?.[raw.kind === 'wake' ? 'question' : 'text'] !== 'string') || raw.erasedAt || raw.reconciliation) { halted = true; return; }
+    const members = raw.memberIds ?? [raw.requestId];
+    if (!Array.isArray(members) || members[0] !== raw.requestId || members.some(id => typeof id !== 'string' || !id) || new Set(members).size !== members.length) { halted = true; return; }
     const frame = { version: 1, runId, requestId: raw.requestId, sequence: raw.sequence, kind: raw.kind,
-      payload: structuredClone(raw.payload) };
+      payload: structuredClone(raw.payload), ...(members.length > 1 ? { memberIds: [...members] } : {}) };
     const old = entries.get(frame.requestId);
     if (old) {
       if (JSON.stringify(old.frame) !== JSON.stringify(frame)) halted = true;
@@ -87,18 +100,22 @@ export function createRunnerChannel({ env, enqueue, prepareCancel, acceptCancel,
       while (!stopped && !halted) {
         const chunk = await reader.read(); if (chunk.done) break;
         pending += decoder.decode(chunk.value, { stream: true });
-        pending = pending.replace(/\r\n/g, '\n');
-        if (pending.length > 4 * 1024 * 1024) { halted = true; break; }
+        pending = pending.replace(/\r/g, '');
         let end;
         while ((end = pending.indexOf('\n\n')) >= 0) {
+          const bound = runnerFrameBound(pending);
+          if (end > bound.limit) throw new Error('Channel frame too large');
           const block = pending.slice(0, end); pending = pending.slice(end + 2);
           const lines = block.split('\n'), event = lines.find(line => line.startsWith('event:'))?.slice(6).trim();
           if (event !== 'request') continue;
-          const frame = JSON.parse(lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n'));
+          const data = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+          if (bound.chars !== undefined && data.length !== bound.chars) throw new Error('Channel frame size mismatch');
+          const frame = JSON.parse(data);
           const id = lines.find(line => line.startsWith('id:'))?.slice(3).trim();
           if (id !== String(frame.sequence)) { halted = true; break; }
           await accept(frame);
         }
+        if (pending.length > runnerFrameBound(pending).limit) throw new Error('Channel frame too large');
       }
     } finally { await reader.cancel().catch(() => {}); }
   };
@@ -154,6 +171,7 @@ export function createRunnerChannel({ env, enqueue, prepareCancel, acceptCancel,
         return withdrawal;
       } catch { return null; }
     },
+    cancelRejected(entry, reason) { return report(entry, 'rejected', { result: { kind: 'cancel', applied: false, reason } }); },
     cancelSubmitted(entry, operationAccepted) { return report(entry, 'submitted', { result: { kind: 'cancel', outcome: 'requested', confirmed: false, operationAccepted } }); },
     cancelResult(entry, outcome, operationAccepted = false, detail) {
       return report(entry, 'result', { result: { kind: 'cancel', outcome, confirmed: outcome === 'cancelled', operationAccepted, ...(detail ? { detail } : {}) } });
